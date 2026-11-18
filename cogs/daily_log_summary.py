@@ -357,13 +357,15 @@ class DailyLogSummaryCog(commands.Cog):
     )
     @app_commands.describe(
         action="What to do.",
-        channel="(set_channel/set_ping_channel) Channel to use. Omit to clear it.",
+        summary_channel="(setup/set_summary_channel) Channel for the daily summary embed.",
+        ping_channel="(setup/set_ping_channel) Channel for the #1 congratulation ping.",
         date="(run) Day to summarise as YYYY-MM-DD. Defaults to yesterday (UTC).",
         message="(set_congrats_message) Template with {users}, {duration}, {date}. Server emoji allowed. Omit to reset.",
     )
     @app_commands.choices(action=[
-        app_commands.Choice(name="set_channel", value="set_channel"),
-        app_commands.Choice(name="set_ping_channel", value="set_ping_channel"),
+        app_commands.Choice(name="setup", value="setup"),
+        app_commands.Choice(name="Set summary channel", value="set_summary_channel"),
+        app_commands.Choice(name="Set congratulation channel", value="set_ping_channel"),
         app_commands.Choice(name="Set congratulation message", value="set_congrats_message"),
         app_commands.Choice(name="status", value="status"),
         app_commands.Choice(name="run", value="run"),
@@ -375,7 +377,8 @@ class DailyLogSummaryCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         action: str,
-        channel: Optional[discord.TextChannel] = None,
+        summary_channel: Optional[discord.TextChannel] = None,
+        ping_channel: Optional[discord.TextChannel] = None,
         date: Optional[str] = None,
         message: Optional[str] = None,
     ):
@@ -391,23 +394,77 @@ class DailyLogSummaryCog(commands.Cog):
             await self._set_congrats_message(interaction, message)
             return
 
-        key = SUMMARY_CHANNEL_KEY if action == "set_channel" else SUMMARY_PING_CHANNEL_KEY
-        config = self.bot.config.setdefault('guilds', {}).setdefault(
-            str(interaction.guild.id), {}
-        )
-        if channel is None:
-            config.pop(key, None)
-            self.bot.save_config()
-            await interaction.response.send_message(
-                f"✅ Cleared `{key}`.", ephemeral=True
+        if action == "setup":
+            await self._set_channels(interaction, summary_channel, ping_channel)
+            return
+
+        if action == "set_summary_channel":
+            # Omitting the channel clears it, which is how the summary is turned off.
+            await self._set_channels(
+                interaction, summary_channel, None, clear_summary=summary_channel is None
             )
             return
 
-        config[key] = str(channel.id)
-        self.bot.save_config()
-        await interaction.response.send_message(
-            f"✅ Set `{key}` to {channel.mention}.", ephemeral=True
+        # set_ping_channel: omitting the channel falls back to the summary channel.
+        await self._set_channels(
+            interaction, None, ping_channel, clear_ping=ping_channel is None
         )
+
+    async def _set_channels(
+        self,
+        interaction: discord.Interaction,
+        summary_channel: Optional[discord.TextChannel],
+        ping_channel: Optional[discord.TextChannel],
+        *,
+        clear_summary: bool = False,
+        clear_ping: bool = False,
+    ):
+        """Update the summary and/or congratulation channels independently."""
+        config = self.bot.config.setdefault('guilds', {}).setdefault(
+            str(interaction.guild.id), {}
+        )
+        changes = []
+
+        if summary_channel is not None:
+            config[SUMMARY_CHANNEL_KEY] = str(summary_channel.id)
+            changes.append(f"Summary channel set to {summary_channel.mention}")
+        elif clear_summary:
+            config.pop(SUMMARY_CHANNEL_KEY, None)
+            changes.append("Summary channel cleared (the daily summary is now off)")
+
+        if ping_channel is not None:
+            config[SUMMARY_PING_CHANNEL_KEY] = str(ping_channel.id)
+            changes.append(f"#1 congratulation channel set to {ping_channel.mention}")
+        elif clear_ping:
+            config.pop(SUMMARY_PING_CHANNEL_KEY, None)
+            changes.append(
+                "#1 congratulation channel cleared (the ping will use the summary channel)"
+            )
+
+        if not changes:
+            await interaction.response.send_message(
+                "Nothing to change — pass `summary_channel` and/or `ping_channel`.",
+                ephemeral=True,
+            )
+            return
+
+        self.bot.save_config()
+
+        embed = discord.Embed(
+            title="✅ Daily summary channels updated",
+            description="\n".join(f"• {change}" for change in changes),
+            color=discord.Color.green(),
+        )
+        summary_id = config.get(SUMMARY_CHANNEL_KEY)
+        ping_id = config.get(SUMMARY_PING_CHANNEL_KEY)
+        if summary_id and ping_id and str(summary_id) == str(ping_id):
+            embed.add_field(
+                name="ℹ️ Same channel",
+                value="Both are set to the same channel, so the #1 ping will appear "
+                      "there too. Pass a different `ping_channel` to separate them.",
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def _show_status(self, interaction: discord.Interaction):
         guild = interaction.guild
@@ -417,10 +474,12 @@ class DailyLogSummaryCog(commands.Cog):
 
         lines = [
             f"**Summary channel:** {summary_channel.mention if summary_channel else 'not set'}",
-            f"**Congratulation channel:** {ping_channel.mention if ping_channel else '(summary channel)'}",
+            f"**Congratulation channel:** {ping_channel.mention if ping_channel else '(same as the summary channel)'}",
             f"**Schedule:** daily at **00:05 UTC** (summarises the UTC day that just ended)",
             f"**Last posted:** {last_posted or 'never'}",
         ]
+        if summary_channel and ping_channel and summary_channel.id == ping_channel.id:
+            lines.append("⚠️ Both are set to the **same** channel.")
         embed = discord.Embed(
             title="📊 Daily Log Summary",
             description="\n".join(lines),

@@ -989,12 +989,12 @@ class CommandsCog(commands.Cog):
             },
             "manage_daily_summary": {
                 "category": "⚙️ Admin Commands",
-                "usage": "/manage_daily_summary action:<set_channel|set_ping_channel|set_congrats_message|status|run> [channel:<#channel>] [message:<template>] [date:<YYYY-MM-DD>]",
+                "usage": "/manage_daily_summary action:<setup|set_summary_channel|set_ping_channel|set_congrats_message|status|run> [summary_channel:<#channel>] [ping_channel:<#channel>] [message:<template>] [date:<YYYY-MM-DD>]",
                 "description": "Configure or test the daily immersion log summary",
-                "details": "set_channel chooses where the daily summary (kizuna + manual logs) is posted; set_ping_channel chooses where the #1 congratulations ping goes (defaults to the summary channel); set_congrats_message sets the congratulation text (placeholders {users}, {duration}, {date}, server emoji allowed); run posts a day on demand.",
+                "details": "setup sets both channels at once; set_summary_channel sets where the daily summary (kizuna + manual logs) is posted; set_ping_channel sets where the #1 congratulations ping goes (falls back to the summary channel); set_congrats_message sets the congratulation text (placeholders {users}, {duration}, {date}, server emoji allowed); run posts a day on demand.",
                 "examples": [
-                    "/manage_daily_summary action:set_channel channel:#immersion",
-                    "/manage_daily_summary action:set_ping_channel channel:#general",
+                    "/manage_daily_summary action:setup summary_channel:#immersion ping_channel:#general",
+                    "/manage_daily_summary action:set_ping_channel ping_channel:#general",
                     "/manage_daily_summary action:set_congrats_message message:🎉 Congrats {users}! Top spot on {date} with {duration} <:poggers:123456789>"
                 ],
                 "admin_only": True
