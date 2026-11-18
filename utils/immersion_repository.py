@@ -760,9 +760,13 @@ class ActivityRepository:
                            COALESCE(SUM(duration), 0) AS duration,
                            COALESCE(SUM(COALESCE(CAST(json_extract(meta, '$.characters') AS INTEGER), 0)), 0) AS characters,
                            COUNT(*) AS logs,
-                           -- Same title == same group, so the max picks up the id
-                           -- even when only some of the day's logs carried one.
-                           MAX(json_extract(meta, '$.vndb_id')) AS vndb_id
+                           -- VN logs keep the id in meta.vn.id (manual and kizuna alike);
+                           -- older rows may use a flat vndb_id or only the vndb.org URL.
+                           COALESCE(
+                               MAX(json_extract(meta, '$.vndb_id')),
+                               MAX(json_extract(meta, '$.vn.id')),
+                               MAX(json_extract(meta, '$.vn.url'))
+                           ) AS vndb_id
                     FROM immersion_activities
                     WHERE {where}
                     GROUP BY name, media_type, primary_type
