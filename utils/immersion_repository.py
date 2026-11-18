@@ -689,6 +689,103 @@ class ActivityRepository:
             logger.error(f"Error getting leaderboard user count: {e}")
             return 0
 
+    async def get_daily_activity_summary(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> Dict[str, Any]:
+        """Aggregate one day of immersion activity for the daily summary.
+
+        Every log source lands in ``immersion_activities`` — kizuna webhook
+        auto-logs and manual ``/log_*`` submissions alike — so this covers both.
+        Deleted entries and blacklisted users are excluded, matching the
+        leaderboard. ``end_date`` is exclusive: pass the start of the next day.
+        """
+        import aiosqlite
+
+        # datetime() normalises stored offsets to UTC: activity dates may carry the
+        # user's local offset, so plain string comparison would misplace them at
+        # day boundaries.
+        where = (
+            "deleted_at IS NULL AND datetime(date) >= datetime(?) "
+            "AND datetime(date) < datetime(?) "
+            "AND user_id NOT IN (SELECT user_id FROM user_blacklist)"
+        )
+        params = (start_date.isoformat(), end_date.isoformat())
+
+        summary: Dict[str, Any] = {
+            'logs': 0,
+            'users': 0,
+            'duration': 0,
+            'reading_duration': 0,
+            'listening_duration': 0,
+            'kizuna_logs': 0,
+            'titles': [],
+            'top_users': [],
+        }
+
+        try:
+            async with aiosqlite.connect(self.db.db_path) as db:
+                db.row_factory = aiosqlite.Row
+
+                async with db.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS logs,
+                        COUNT(DISTINCT user_id) AS users,
+                        COALESCE(SUM(duration), 0) AS duration,
+                        COALESCE(SUM(CASE WHEN primary_type = 'reading' THEN duration ELSE 0 END), 0) AS reading_duration,
+                        COALESCE(SUM(CASE WHEN primary_type = 'listening' THEN duration ELSE 0 END), 0) AS listening_duration,
+                        COALESCE(SUM(CASE WHEN json_extract(meta, '$.kizuna_message_id') IS NOT NULL THEN 1 ELSE 0 END), 0) AS kizuna_logs
+                    FROM immersion_activities
+                    WHERE {where}
+                    """,
+                    params,
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row is not None:
+                        summary['logs'] = int(row['logs'] or 0)
+                        summary['users'] = int(row['users'] or 0)
+                        summary['duration'] = int(row['duration'] or 0)
+                        summary['reading_duration'] = int(row['reading_duration'] or 0)
+                        summary['listening_duration'] = int(row['listening_duration'] or 0)
+                        summary['kizuna_logs'] = int(row['kizuna_logs'] or 0)
+
+                async with db.execute(
+                    f"""
+                    SELECT name, media_type, primary_type,
+                           COALESCE(SUM(duration), 0) AS duration,
+                           COUNT(*) AS logs
+                    FROM immersion_activities
+                    WHERE {where}
+                    GROUP BY name, media_type, primary_type
+                    ORDER BY duration DESC
+                    LIMIT 5
+                    """,
+                    params,
+                ) as cursor:
+                    summary['titles'] = [dict(r) for r in await cursor.fetchall()]
+
+                async with db.execute(
+                    f"""
+                    SELECT user_id, COALESCE(SUM(duration), 0) AS duration, COUNT(*) AS logs
+                    FROM immersion_activities
+                    WHERE {where}
+                    GROUP BY user_id
+                    HAVING duration > 0
+                    ORDER BY duration DESC, user_id ASC
+                    LIMIT 5
+                    """,
+                    params,
+                ) as cursor:
+                    summary['top_users'] = [dict(r) for r in await cursor.fetchall()]
+
+            return summary
+
+        except Exception as e:
+            logger.error(f"Error aggregating daily activity summary: {e}")
+            return summary
+
     async def get_vn_durations_by_user(
         self,
         guild_id: Optional[str] = None,
