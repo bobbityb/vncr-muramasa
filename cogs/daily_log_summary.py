@@ -27,6 +27,7 @@ The summary for a UTC day is posted shortly after that day ends (00:05 UTC).
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -106,6 +107,17 @@ def _format_count(value: Any) -> str:
         return f"{int(value or 0):,}"
     except (TypeError, ValueError):
         return "0"
+
+
+def _clean_vndb_id(value: Any) -> Optional[str]:
+    """Normalise a stored VNDB id to ``v1234``; None when it is unusable."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.isdigit():
+        return f"v{int(text)}"
+    match = re.search(r'v(\d+)', text, re.IGNORECASE)
+    return f"v{int(match.group(1))}" if match else None
 
 
 class DailyLogSummaryCog(commands.Cog):
@@ -302,17 +314,13 @@ class DailyLogSummaryCog(commands.Cog):
         total = stats.get('duration', 0) or 0
         logs = stats.get('logs', 0) or 0
         users = stats.get('users', 0) or 0
-        kizuna_logs = stats.get('kizuna_logs', 0) or 0
-        manual_logs = max(0, logs - kizuna_logs)
 
         overview = [
             f"**Logged time:** {_format_duration(total)}",
             f"**Logs:** {logs} from {users} member{'s' if users != 1 else ''}",
-            f"**Reading:** {_format_duration(stats.get('reading_duration', 0))}",
         ]
         if appearance['show_characters']:
             overview.append(f"**Characters read:** {_format_count(stats.get('characters', 0))}")
-        overview.append(f"**Source:** {kizuna_logs} kizuna • {manual_logs} manual")
 
         embed = discord.Embed(
             title=title[:256],
@@ -330,7 +338,11 @@ class DailyLogSummaryCog(commands.Cog):
             lines = []
             for entry in titles[:5]:
                 media_type = (entry.get('media_type') or "").strip().lower()
-                line = f"• **{entry.get('name') or 'Unknown'}** — {_format_duration(entry.get('duration', 0))}"
+                # Escape link-breaking characters so odd titles cannot break the embed.
+                name = (entry.get('name') or 'Unknown').replace('[', '\\[').replace(']', '\\]')
+                vndb_id = _clean_vndb_id(entry.get('vndb_id'))
+                label = f"[{name}](https://vndb.org/{vndb_id})" if vndb_id else f"{name}"
+                line = f"• {label} — {_format_duration(entry.get('duration', 0))}"
                 # Visual novels are the norm here, so only label other media.
                 if media_type and media_type != 'visual_novel':
                     line += f" ({media_type.replace('_', ' ').title()})"
@@ -344,8 +356,10 @@ class DailyLogSummaryCog(commands.Cog):
                 medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"{index}.")
                 name = await self._display_name(guild, entry.get('user_id'))
                 entry_logs = entry.get('logs', 0) or 0
+                entry_characters = entry.get('characters', 0) or 0
                 lines.append(
-                    f"{medal} **{name}** — {_format_duration(entry.get('duration', 0))} "
+                    f"{medal} **{name}** — {_format_duration(entry.get('duration', 0))} • "
+                    f"{_format_count(entry_characters)} chars "
                     f"({entry_logs} log{'s' if entry_logs != 1 else ''})"
                 )
             embed.add_field(name="🏆 Leaderboard", value="\n".join(lines)[:1024], inline=False)

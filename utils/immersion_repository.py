@@ -759,7 +759,10 @@ class ActivityRepository:
                     SELECT name, media_type, primary_type,
                            COALESCE(SUM(duration), 0) AS duration,
                            COALESCE(SUM(COALESCE(CAST(json_extract(meta, '$.characters') AS INTEGER), 0)), 0) AS characters,
-                           COUNT(*) AS logs
+                           COUNT(*) AS logs,
+                           -- Same title == same group, so the max picks up the id
+                           -- even when only some of the day's logs carried one.
+                           MAX(json_extract(meta, '$.vndb_id')) AS vndb_id
                     FROM immersion_activities
                     WHERE {where}
                     GROUP BY name, media_type, primary_type
