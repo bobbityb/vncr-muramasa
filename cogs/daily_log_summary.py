@@ -49,6 +49,8 @@ SHOW_LEADERBOARD_KEY = 'daily_summary_show_leaderboard'
 SHOW_CHARACTERS_KEY = 'daily_summary_show_characters'
 CONGRATS_SHOW_CHARACTERS_KEY = 'daily_summary_congrats_show_characters'
 STATE_FILE = 'data/daily_summary_state.json'
+# VN Club hosts the per-VN pages; the trailing numeric part is the VNDB id.
+VN_CLUB_VN_URL = 'https://vnclub.figamin.net/vn/'
 
 DEFAULT_SUMMARY_TITLE = "📊 Daily Immersion Summary — {month} {day}, {year}"
 DEFAULT_SUMMARY_FOOTER = "Includes kizuna and manual logs. Days and times are UTC."
@@ -118,6 +120,14 @@ def _clean_vndb_id(value: Any) -> Optional[str]:
         return f"v{int(text)}"
     match = re.search(r'v(\d+)', text, re.IGNORECASE)
     return f"v{int(match.group(1))}" if match else None
+
+
+def _vnclub_url(value: Any) -> Optional[str]:
+    """Build the VN Club page for a stored VNDB id (e.g. ``/vn/711``)."""
+    vndb_id = _clean_vndb_id(value)
+    if not vndb_id:
+        return None
+    return f"{VN_CLUB_VN_URL}{vndb_id[1:]}"
 
 
 class DailyLogSummaryCog(commands.Cog):
@@ -340,8 +350,11 @@ class DailyLogSummaryCog(commands.Cog):
                 media_type = (entry.get('media_type') or "").strip().lower()
                 # Escape link-breaking characters so odd titles cannot break the embed.
                 name = (entry.get('name') or 'Unknown').replace('[', '\\[').replace(']', '\\]')
-                vndb_id = _clean_vndb_id(entry.get('vndb_id'))
-                label = f"[{name}](https://vndb.org/{vndb_id})" if vndb_id else f"{name}"
+                vnclub_url = (
+                    _vnclub_url(entry.get('vndb_id'))
+                    if media_type in ('', 'visual_novel') else None
+                )
+                label = f"[{name}]({vnclub_url})" if vnclub_url else f"{name}"
                 line = f"• {label} — {_format_duration(entry.get('duration', 0))}"
                 # Visual novels are the norm here, so only label other media.
                 if media_type and media_type != 'visual_novel':
