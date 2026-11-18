@@ -17,6 +17,9 @@ Configuration lives in config.json per guild:
     daily_summary_color            optional embed colour (#RRGGBB)
     daily_summary_show_titles      show the "Most logged titles" section
     daily_summary_show_leaderboard show the "Leaderboard" section
+    daily_summary_show_characters  show characters read in the Overview field
+    daily_summary_congrats_show_characters
+                                   append characters read to the #1 message
 
 The summary for a UTC day is posted shortly after that day ends (00:05 UTC).
 """
@@ -42,14 +45,16 @@ FOOTER_KEY = 'daily_summary_footer'
 COLOR_KEY = 'daily_summary_color'
 SHOW_TITLES_KEY = 'daily_summary_show_titles'
 SHOW_LEADERBOARD_KEY = 'daily_summary_show_leaderboard'
+SHOW_CHARACTERS_KEY = 'daily_summary_show_characters'
+CONGRATS_SHOW_CHARACTERS_KEY = 'daily_summary_congrats_show_characters'
 STATE_FILE = 'data/daily_summary_state.json'
 
 DEFAULT_SUMMARY_TITLE = "📊 Daily Immersion Summary — {month} {day}, {year}"
 DEFAULT_SUMMARY_FOOTER = "Includes kizuna and manual logs. Days and times are UTC."
 SUMMARY_PLACEHOLDERS_HINT = (
     "Placeholders: `{month}`, `{day}`, `{year}`, `{date}`, `{total}`, `{logs}`, "
-    "`{users}`, `{reading}`, `{listening}`, `{kizuna_logs}`, `{manual_logs}`. "
-    "Server emoji such as `<:name:id>` work too."
+    "`{users}`, `{reading}`, `{listening}`, `{characters}`, `{kizuna_logs}`, "
+    "`{manual_logs}`. Server emoji such as `<:name:id>` work too."
 )
 # Sample values used to validate templates when they are saved and to preview them.
 SAMPLE_PLACEHOLDER_VALUES = {
@@ -62,6 +67,7 @@ SAMPLE_PLACEHOLDER_VALUES = {
     'users': '7',
     'reading': '9h 10m',
     'listening': '3h 20m',
+    'characters': '1,234,567',
     'kizuna_logs': '35',
     'manual_logs': '7',
 }
@@ -73,8 +79,8 @@ DEFAULT_CONGRATS_MESSAGE = (
     "leaderboard with **{duration}**."
 )
 CONGRATS_PLACEHOLDERS_HINT = (
-    "Placeholders: `{users}` (winner mention), `{duration}`, `{date}`. "
-    "Server emoji such as `<:name:id>` (or `<a:name:id>`) work too."
+    "Placeholders: `{users}` (winner mention), `{duration}`, `{characters}`, "
+    "`{date}`. Server emoji such as `<:name:id>` (or `<a:name:id>`) work too."
 )
 
 # 00:05 UTC: the day being summarised is complete, and a log that lands exactly
@@ -92,6 +98,14 @@ def _format_duration(seconds: Any) -> str:
     if hours:
         return f"{hours}h"
     return f"{minutes}m"
+
+
+def _format_count(value: Any) -> str:
+    """Render a large count with thousands separators, e.g. ``1,234,567``."""
+    try:
+        return f"{int(value or 0):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 class DailyLogSummaryCog(commands.Cog):
@@ -230,6 +244,7 @@ class DailyLogSummaryCog(commands.Cog):
             'color_obj': self._parse_color(config.get(COLOR_KEY)) or discord.Color.blurple(),
             'show_titles': self._as_bool(config.get(SHOW_TITLES_KEY), True),
             'show_leaderboard': self._as_bool(config.get(SHOW_LEADERBOARD_KEY), True),
+            'show_characters': self._as_bool(config.get(SHOW_CHARACTERS_KEY), False),
         }
 
     @staticmethod
@@ -246,6 +261,7 @@ class DailyLogSummaryCog(commands.Cog):
             'users': str(stats.get('users', 0) or 0),
             'reading': _format_duration(stats.get('reading_duration', 0)),
             'listening': _format_duration(stats.get('listening_duration', 0)),
+            'characters': _format_count(stats.get('characters', 0)),
             'kizuna_logs': str(kizuna_logs),
             'manual_logs': str(max(0, logs - kizuna_logs)),
         }
@@ -273,6 +289,7 @@ class DailyLogSummaryCog(commands.Cog):
             'color_obj': discord.Color.blurple(),
             'show_titles': True,
             'show_leaderboard': True,
+            'show_characters': False,
         }
         values = self._summary_placeholders(day, stats)
 
@@ -288,6 +305,18 @@ class DailyLogSummaryCog(commands.Cog):
         kizuna_logs = stats.get('kizuna_logs', 0) or 0
         manual_logs = max(0, logs - kizuna_logs)
 
+        overview = [
+            f"**Logged time:** {_format_duration(total)}",
+            f"**Logs:** {logs} from {users} member{'s' if users != 1 else ''}",
+            (
+                f"**Reading:** {_format_duration(stats.get('reading_duration', 0))} • "
+                f"**Listening:** {_format_duration(stats.get('listening_duration', 0))}"
+            ),
+        ]
+        if appearance['show_characters']:
+            overview.append(f"**Characters read:** {_format_count(stats.get('characters', 0))}")
+        overview.append(f"**Source:** {kizuna_logs} kizuna • {manual_logs} manual")
+
         embed = discord.Embed(
             title=title[:256],
             description=description[:4096] or None,
@@ -295,13 +324,7 @@ class DailyLogSummaryCog(commands.Cog):
         )
         embed.add_field(
             name="Overview",
-            value=(
-                f"**Logged time:** {_format_duration(total)}\n"
-                f"**Logs:** {logs} from {users} member{'s' if users != 1 else ''}\n"
-                f"**Reading:** {_format_duration(stats.get('reading_duration', 0))} • "
-                f"**Listening:** {_format_duration(stats.get('listening_duration', 0))}\n"
-                f"**Source:** {kizuna_logs} kizuna • {manual_logs} manual"
-            ),
+            value="\n".join(overview),
             inline=False,
         )
 
@@ -343,6 +366,34 @@ class DailyLogSummaryCog(commands.Cog):
                 "Daily summary: invalid congratulation template; using the default"
             )
             return DEFAULT_CONGRATS_MESSAGE.format(**values)
+
+    def _compose_congrats(
+        self,
+        guild_id: int,
+        *,
+        users: str,
+        duration: str,
+        date: str,
+        characters: int,
+    ) -> str:
+        """Render the #1 message, honouring the characters-read option.
+
+        When the option is enabled the count is appended automatically, unless the
+        template already places ``{characters}`` itself.
+        """
+        config = self._guild_config(guild_id)
+        template = config.get(SUMMARY_CONGRATS_KEY) or DEFAULT_CONGRATS_MESSAGE
+        rendered = _format_count(characters)
+        text = self._render_congrats(
+            template,
+            users=users,
+            duration=duration,
+            date=date,
+            characters=rendered,
+        )
+        if self._as_bool(config.get(CONGRATS_SHOW_CHARACTERS_KEY), False) and '{characters}' not in template:
+            text += f"\n📖 **{rendered}** characters read"
+        return text
 
     def _parse_day(self, value: Optional[str]) -> Optional[date]:
         """Parse an optional YYYY-MM-DD; default is the UTC day that just ended."""
@@ -405,15 +456,18 @@ class DailyLogSummaryCog(commands.Cog):
             return None
 
         who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
-        template = (
-            self._guild_config(guild.id).get(SUMMARY_CONGRATS_KEY)
-            or DEFAULT_CONGRATS_MESSAGE
-        )
-        return self._render_congrats(
-            template,
+        characters = 0
+        for entry in tied:
+            try:
+                characters += int(entry.get('characters', 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        return self._compose_congrats(
+            guild.id,
             users=who,
             duration=_format_duration(best_duration),
             date=f"{day:%B} {day.day}",
+            characters=characters,
         )
 
     async def _build_no_log_embed(self, guild: discord.Guild, day: date, stats: Dict[str, Any]) -> discord.Embed:
@@ -549,6 +603,7 @@ class DailyLogSummaryCog(commands.Cog):
         color="(setup) Embed colour as #RRGGBB.",
         show_titles="(setup) Show the 'Most logged titles' section.",
         show_leaderboard="(setup) Show the 'Leaderboard' section.",
+        show_characters="(setup) Show the characters read next to the reading time.",
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="setup", value="setup"),
@@ -573,6 +628,7 @@ class DailyLogSummaryCog(commands.Cog):
         color: Optional[str] = None,
         show_titles: Optional[bool] = None,
         show_leaderboard: Optional[bool] = None,
+        show_characters: Optional[bool] = None,
     ):
         if action == "status":
             await self._show_summary_status(interaction)
@@ -605,6 +661,7 @@ class DailyLogSummaryCog(commands.Cog):
             color=color,
             show_titles=show_titles,
             show_leaderboard=show_leaderboard,
+            show_characters=show_characters,
         )
 
     async def _set_summary_settings(
@@ -619,6 +676,7 @@ class DailyLogSummaryCog(commands.Cog):
         color: Optional[str] = None,
         show_titles: Optional[bool] = None,
         show_leaderboard: Optional[bool] = None,
+        show_characters: Optional[bool] = None,
     ) -> None:
         """Validate every supplied value first, then apply them all in one save."""
         # (config key, value, human readable change); value None means "remove".
@@ -714,6 +772,12 @@ class DailyLogSummaryCog(commands.Cog):
                 f"Leaderboard section {'shown' if show_leaderboard else 'hidden'}",
             ))
 
+        if show_characters is not None:
+            pending.append((
+                SHOW_CHARACTERS_KEY, bool(show_characters),
+                f"Characters read {'shown' if show_characters else 'hidden'}",
+            ))
+
         if not pending:
             await interaction.response.send_message(
                 "Nothing to change — pass a channel and/or at least one style option.",
@@ -766,6 +830,7 @@ class DailyLogSummaryCog(commands.Cog):
             f"**Colour:** {appearance['color'] or 'default (blurple)'}",
             f"**Titles section:** {'on' if appearance['show_titles'] else 'off'}",
             f"**Leaderboard section:** {'on' if appearance['show_leaderboard'] else 'off'}",
+            f"**Characters read:** {'shown' if appearance['show_characters'] else 'hidden'}",
         ]
         embed = discord.Embed(
             title="📊 Daily immersion summary",
@@ -788,63 +853,98 @@ class DailyLogSummaryCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def _set_congrats_message(self, interaction: discord.Interaction, message: Optional[str]):
-        """Store a per-guild congratulation template, or clear it to restore the default."""
+    async def _set_congrats_message(
+        self,
+        interaction: discord.Interaction,
+        message: Optional[str],
+        show_characters: Optional[bool] = None,
+    ):
+        """Store the congratulation template and/or the characters-read option."""
         config = self.bot.config.setdefault('guilds', {}).setdefault(
             str(interaction.guild.id), {}
         )
+        template = message.strip() if message is not None else ""
+        # Omitting everything (or passing an empty message) resets to the default;
+        # passing only show_characters just flips that option.
+        reset_requested = not template and show_characters is None
 
-        if message is None or not message.strip():
-            config.pop(SUMMARY_CONGRATS_KEY, None)
-            self.bot.save_config()
+        if template:
+            if len(template) > 1500:
+                await interaction.response.send_message(
+                    "❌ The message must be 1500 characters or fewer.", ephemeral=True
+                )
+                return
+            if "{users}" not in template:
+                await interaction.response.send_message(
+                    "❌ Include `{users}` so the winner is pinged.", ephemeral=True
+                )
+                return
+            try:
+                template.format(
+                    users=interaction.user.mention,
+                    duration="2h 15m",
+                    date="November 18",
+                    characters="1,234,567",
+                )
+            except (KeyError, IndexError, ValueError) as exc:
+                detail = str(exc).strip("'\"") or "malformed braces"
+                await interaction.response.send_message(
+                    f"❌ Invalid template ({detail}). Only `{{users}}`, `{{duration}}`, "
+                    "`{{date}}` and `{{characters}}` are supported.",
+                    ephemeral=True,
+                )
+                return
+
+        changes = []
+        if reset_requested:
+            if SUMMARY_CONGRATS_KEY in config:
+                config.pop(SUMMARY_CONGRATS_KEY, None)
+                changes.append("Message reset to the default")
+            else:
+                changes.append("Message is already using the default")
+        elif template:
+            config[SUMMARY_CONGRATS_KEY] = template
+            changes.append("Message updated")
+
+        if show_characters is not None:
+            if show_characters:
+                config[CONGRATS_SHOW_CHARACTERS_KEY] = True
+                changes.append("Characters read will be included")
+            else:
+                config.pop(CONGRATS_SHOW_CHARACTERS_KEY, None)
+                changes.append("Characters read hidden")
+
+        if not changes:
             await interaction.response.send_message(
-                "✅ Congratulation message reset to the default:\n"
-                f"```{DEFAULT_CONGRATS_MESSAGE}```",
+                "Nothing to change — pass `message` and/or `show_characters`.",
                 ephemeral=True,
             )
             return
 
-        template = message.strip()
-        if len(template) > 1500:
-            await interaction.response.send_message(
-                "❌ The message must be 1500 characters or fewer.", ephemeral=True
-            )
-            return
-        if "{users}" not in template:
-            await interaction.response.send_message(
-                "❌ Include `{users}` so the winner is pinged.", ephemeral=True
-            )
-            return
-
-        try:
-            preview = template.format(
-                users=interaction.user.mention,
-                duration="2h 15m",
-                date="November 18",
-            )
-        except (KeyError, IndexError, ValueError) as exc:
-            detail = str(exc).strip("'\"") or "malformed braces"
-            await interaction.response.send_message(
-                f"❌ Invalid template ({detail}). Only `{{users}}`, `{{duration}}` "
-                "and `{{date}}` are supported.",
-                ephemeral=True,
-            )
-            return
-
-        config[SUMMARY_CONGRATS_KEY] = template
         self.bot.save_config()
 
+        active_template = config.get(SUMMARY_CONGRATS_KEY) or DEFAULT_CONGRATS_MESSAGE
+        preview = self._compose_congrats(
+            interaction.guild.id,
+            users=interaction.user.mention,
+            duration="2h 15m",
+            date="November 18",
+            characters=1234567,
+        )
         embed = discord.Embed(
             title="✅ Congratulation message updated",
             description=(
-                "**Template:**\n"
-                f"```{template}```\n"
-                "**Preview:**\n"
-                f"{preview}"
-            ),
+                "\n".join(f"• {change}" for change in changes)
+                + "\n\n**Template:**\n"
+                + f"```{active_template}```\n"
+                + "**Preview:**\n"
+                + preview
+            )[:4096],
             color=discord.Color.green(),
         )
-        embed.set_footer(text="Omit `message` to reset to the default.")
+        embed.set_footer(
+            text="Omit `message` to reset to the default. {characters} = characters read."
+        )
         await interaction.response.send_message(
             embed=embed,
             ephemeral=True,
@@ -862,7 +962,8 @@ class DailyLogSummaryCog(commands.Cog):
     @app_commands.describe(
         action="What to do.",
         channel="(set_channel) Where the ping is sent. Omit to fall back to the summary channel.",
-        message="(set_message) Template with {users}, {duration}, {date}. Server emoji allowed. Omit to reset.",
+        message="(set_message) Template with {users}, {duration}, {date}, {characters}. Server emoji allowed. Omit to reset.",
+        show_characters="(set_message) Also show how many characters the winner read.",
         date="(run/test) Day as YYYY-MM-DD. Defaults to yesterday (UTC).",
     )
     @app_commands.choices(action=[
@@ -881,6 +982,7 @@ class DailyLogSummaryCog(commands.Cog):
         action: str,
         channel: Optional[discord.TextChannel] = None,
         message: Optional[str] = None,
+        show_characters: Optional[bool] = None,
         date: Optional[str] = None,
     ):
         if action == "status":
@@ -896,7 +998,7 @@ class DailyLogSummaryCog(commands.Cog):
             return
 
         if action == "set_message":
-            await self._set_congrats_message(interaction, message)
+            await self._set_congrats_message(interaction, message, show_characters)
             return
 
         await self._set_congrats_channel(interaction, channel)
@@ -971,6 +1073,12 @@ class DailyLogSummaryCog(commands.Cog):
             f"**Channel:** {target}",
             "**Schedule:** daily at **00:05 UTC**, right after the summary",
             f"**Last sent:** {self._posted_congrats.get(str(guild.id)) or 'never'}",
+            f"**Characters read:** "
+            + (
+                "included"
+                if self._as_bool(self._guild_config(guild.id).get(CONGRATS_SHOW_CHARACTERS_KEY), False)
+                else "hidden"
+            ),
         ]
         embed = discord.Embed(
             title="🏆 Daily #1 congratulation",
@@ -1068,15 +1176,12 @@ class DailyLogSummaryCog(commands.Cog):
         if preview is None:
             # No logs, or nobody eligible: render the template with sample numbers so
             # the formatting can still be checked.
-            template = (
-                self._guild_config(interaction.guild.id).get(SUMMARY_CONGRATS_KEY)
-                or DEFAULT_CONGRATS_MESSAGE
-            )
-            preview = self._render_congrats(
-                template,
+            preview = self._compose_congrats(
+                interaction.guild.id,
                 users=f"**{interaction.user.display_name}**",
                 duration="2h 15m",
                 date=f"{day:%B} {day.day}",
+                characters=1234567,
             )
             note = (
                 f"No immersion logs were found for **{day.isoformat()}**, so this "
@@ -1113,7 +1218,7 @@ class DailyLogSummaryCog(commands.Cog):
         removed = []
         for key in (
             TITLE_KEY, DESCRIPTION_KEY, FOOTER_KEY, COLOR_KEY,
-            SHOW_TITLES_KEY, SHOW_LEADERBOARD_KEY,
+            SHOW_TITLES_KEY, SHOW_LEADERBOARD_KEY, SHOW_CHARACTERS_KEY,
         ):
             if key in config:
                 config.pop(key, None)

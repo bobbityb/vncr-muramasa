@@ -989,12 +989,12 @@ class CommandsCog(commands.Cog):
             },
             "manage_daily_summary": {
                 "category": "⚙️ Admin Commands",
-                "usage": "/manage_daily_summary action:<setup|set_channel|reset_style|status|run|test> [channel:<#channel>] [date:<YYYY-MM-DD>] [title:<template>] [description:<template>] [footer:<template>] [color:<#RRGGBB>] [show_titles:<bool>] [show_leaderboard:<bool>]",
+                "usage": "/manage_daily_summary action:<setup|set_channel|reset_style|status|run|test> [channel:<#channel>] [date:<YYYY-MM-DD>] [title:<template>] [description:<template>] [footer:<template>] [color:<#RRGGBB>] [show_titles:<bool>] [show_leaderboard:<bool>] [show_characters:<bool>]",
                 "description": "Configure, post or preview the daily immersion summary",
-                "details": "setup sets the channel and any style options in one go; set_channel changes (or, with no channel, clears) where the summary is posted; reset_style restores the default look; status shows the current settings; run posts a day's summary now; test shows a private preview only you can see (nothing is posted). Templates support {month}, {day}, {year}, {date}, {total}, {logs}, {users}, {reading}, {listening}, {kizuna_logs}, {manual_logs} and server emoji.",
+                "details": "setup sets the channel and any style options in one go; set_channel changes (or, with no channel, clears) where the summary is posted; reset_style restores the default look; status shows the current settings; run posts a day's summary now; test shows a private preview only you can see (nothing is posted). show_characters adds a 'Characters read' line next to the reading time. Templates support {month}, {day}, {year}, {date}, {total}, {logs}, {users}, {reading}, {listening}, {characters}, {kizuna_logs}, {manual_logs} and server emoji.",
                 "examples": [
                     "/manage_daily_summary action:setup channel:#immersion title:📊 {month} recap color:#5865F2",
-                    "/manage_daily_summary action:set_channel channel:#immersion",
+                    "/manage_daily_summary action:setup show_characters:true",
                     "/manage_daily_summary action:test",
                     "/manage_daily_summary action:run date:2026-11-18"
                 ],
@@ -1002,12 +1002,13 @@ class CommandsCog(commands.Cog):
             },
             "manage_daily_congrats": {
                 "category": "⚙️ Admin Commands",
-                "usage": "/manage_daily_congrats action:<set_channel|set_message|status|run|test> [channel:<#channel>] [message:<template>] [date:<YYYY-MM-DD>]",
+                "usage": "/manage_daily_congrats action:<set_channel|set_message|status|run|test> [channel:<#channel>] [message:<template>] [show_characters:<bool>] [date:<YYYY-MM-DD>]",
                 "description": "Configure, send or preview the #1 congratulation ping",
-                "details": "set_channel sets where the ping goes (omit the channel to fall back to the summary channel); set_message sets the text (omit it to reset to the default; placeholders {users}, {duration}, {date}, server emoji allowed); status shows the current setup; run sends the ping for a day now; test shows a private preview with no actual ping.",
+                "details": "set_channel sets where the ping goes (omit the channel to fall back to the summary channel); set_message sets the text (omit it to reset to the default; placeholders {users}, {duration}, {date}, {characters}, server emoji allowed); show_characters adds the winner's characters read to the message (automatically appended unless your template uses {characters}); status shows the current setup; run sends the ping for a day now; test shows a private preview with no actual ping.",
                 "examples": [
                     "/manage_daily_congrats action:set_channel channel:#general",
-                    "/manage_daily_congrats action:set_message message:🎉 Congrats {users}! Top spot on {date} with {duration} <:poggers:123456789>",
+                    "/manage_daily_congrats action:set_message message:🎉 Congrats {users}! Top spot on {date} with {duration} ({characters} chars) <:poggers:123456789>",
+                    "/manage_daily_congrats action:set_message show_characters:true",
                     "/manage_daily_congrats action:test"
                 ],
                 "admin_only": True

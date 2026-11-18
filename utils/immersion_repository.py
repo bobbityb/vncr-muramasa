@@ -719,6 +719,7 @@ class ActivityRepository:
             'duration': 0,
             'reading_duration': 0,
             'listening_duration': 0,
+            'characters': 0,
             'kizuna_logs': 0,
             'titles': [],
             'top_users': [],
@@ -736,6 +737,7 @@ class ActivityRepository:
                         COALESCE(SUM(duration), 0) AS duration,
                         COALESCE(SUM(CASE WHEN primary_type = 'reading' THEN duration ELSE 0 END), 0) AS reading_duration,
                         COALESCE(SUM(CASE WHEN primary_type = 'listening' THEN duration ELSE 0 END), 0) AS listening_duration,
+                        COALESCE(SUM(COALESCE(CAST(json_extract(meta, '$.characters') AS INTEGER), 0)), 0) AS characters,
                         COALESCE(SUM(CASE WHEN json_extract(meta, '$.kizuna_message_id') IS NOT NULL THEN 1 ELSE 0 END), 0) AS kizuna_logs
                     FROM immersion_activities
                     WHERE {where}
@@ -749,12 +751,14 @@ class ActivityRepository:
                         summary['duration'] = int(row['duration'] or 0)
                         summary['reading_duration'] = int(row['reading_duration'] or 0)
                         summary['listening_duration'] = int(row['listening_duration'] or 0)
+                        summary['characters'] = int(row['characters'] or 0)
                         summary['kizuna_logs'] = int(row['kizuna_logs'] or 0)
 
                 async with db.execute(
                     f"""
                     SELECT name, media_type, primary_type,
                            COALESCE(SUM(duration), 0) AS duration,
+                           COALESCE(SUM(COALESCE(CAST(json_extract(meta, '$.characters') AS INTEGER), 0)), 0) AS characters,
                            COUNT(*) AS logs
                     FROM immersion_activities
                     WHERE {where}
@@ -768,7 +772,10 @@ class ActivityRepository:
 
                 async with db.execute(
                     f"""
-                    SELECT user_id, COALESCE(SUM(duration), 0) AS duration, COUNT(*) AS logs
+                    SELECT user_id,
+                           COALESCE(SUM(duration), 0) AS duration,
+                           COALESCE(SUM(COALESCE(CAST(json_extract(meta, '$.characters') AS INTEGER), 0)), 0) AS characters,
+                           COUNT(*) AS logs
                     FROM immersion_activities
                     WHERE {where}
                     GROUP BY user_id
