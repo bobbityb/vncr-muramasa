@@ -11,6 +11,12 @@ Configuration lives in config.json per guild:
                                    (falls back to the summary channel)
     daily_summary_congrats_message optional template for the congratulation
                                    (defaults to DEFAULT_CONGRATS_MESSAGE)
+    daily_summary_title            optional embed title template
+    daily_summary_description      optional embed description template
+    daily_summary_footer           optional embed footer template
+    daily_summary_color            optional embed colour (#RRGGBB)
+    daily_summary_show_titles      show the "Most logged titles" section
+    daily_summary_show_leaderboard show the "Leaderboard" section
 
 The summary for a UTC day is posted shortly after that day ends (00:05 UTC).
 """
@@ -30,7 +36,35 @@ logger = logging.getLogger(__name__)
 SUMMARY_CHANNEL_KEY = 'daily_summary_channel'
 SUMMARY_PING_CHANNEL_KEY = 'daily_summary_ping_channel'
 SUMMARY_CONGRATS_KEY = 'daily_summary_congrats_message'
+TITLE_KEY = 'daily_summary_title'
+DESCRIPTION_KEY = 'daily_summary_description'
+FOOTER_KEY = 'daily_summary_footer'
+COLOR_KEY = 'daily_summary_color'
+SHOW_TITLES_KEY = 'daily_summary_show_titles'
+SHOW_LEADERBOARD_KEY = 'daily_summary_show_leaderboard'
 STATE_FILE = 'data/daily_summary_state.json'
+
+DEFAULT_SUMMARY_TITLE = "📊 Daily Immersion Summary — {month} {day}, {year}"
+DEFAULT_SUMMARY_FOOTER = "Includes kizuna and manual logs. Days and times are UTC."
+SUMMARY_PLACEHOLDERS_HINT = (
+    "Placeholders: `{month}`, `{day}`, `{year}`, `{date}`, `{total}`, `{logs}`, "
+    "`{users}`, `{reading}`, `{listening}`, `{kizuna_logs}`, `{manual_logs}`. "
+    "Server emoji such as `<:name:id>` work too."
+)
+# Sample values used to validate templates when they are saved and to preview them.
+SAMPLE_PLACEHOLDER_VALUES = {
+    'month': 'November',
+    'day': '18',
+    'year': '2026',
+    'date': 'November 18, 2026',
+    'total': '12h 30m',
+    'logs': '42',
+    'users': '7',
+    'reading': '9h 10m',
+    'listening': '3h 20m',
+    'kizuna_logs': '35',
+    'manual_logs': '7',
+}
 
 # Supported placeholders in a custom congratulation message. ``{users}`` is
 # required so the winner is always pinged.
@@ -65,9 +99,12 @@ class DailyLogSummaryCog(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        # guild id -> ISO date already summarised, so a restart around the run
-        # time cannot post the same day twice.
-        self._posted_days: Dict[str, str] = self._load_state()
+        # Per-feature guild -> ISO date already posted, so a restart around the
+        # run time cannot post the same day twice. Summary and ping are tracked
+        # independently so either can be re-run without the other.
+        state = self._load_state()
+        self._posted_summary: Dict[str, str] = state['summary']
+        self._posted_congrats: Dict[str, str] = state['congrats']
 
     # ------------------------------------------------------------------
     # Lifecycle / persistence
@@ -79,23 +116,36 @@ class DailyLogSummaryCog(commands.Cog):
     async def cog_unload(self):
         self.post_daily_summary.cancel()
 
-    def _load_state(self) -> Dict[str, str]:
+    def _load_state(self) -> Dict[str, Dict[str, str]]:
+        empty = {'summary': {}, 'congrats': {}}
         try:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, 'r') as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    return {str(k): str(v) for k, v in data.items()}
+                    if 'summary' in data or 'congrats' in data:
+                        return {
+                            'summary': {str(k): str(v) for k, v in (data.get('summary') or {}).items()},
+                            'congrats': {str(k): str(v) for k, v in (data.get('congrats') or {}).items()},
+                        }
+                    # Legacy shape: a flat guild -> date map that tracked the summary only.
+                    return {
+                        'summary': {str(k): str(v) for k, v in data.items()},
+                        'congrats': {},
+                    }
         except Exception:
             logger.exception("Daily summary: could not read %s", STATE_FILE)
-        return {}
+        return empty
 
     def _save_state(self):
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             tmp_path = f"{STATE_FILE}.tmp"
             with open(tmp_path, 'w') as f:
-                json.dump(self._posted_days, f, indent=2)
+                json.dump(
+                    {'summary': self._posted_summary, 'congrats': self._posted_congrats},
+                    f, indent=2,
+                )
             os.replace(tmp_path, STATE_FILE)
         except Exception:
             logger.exception("Daily summary: could not write %s", STATE_FILE)
@@ -150,7 +200,88 @@ class DailyLogSummaryCog(commands.Cog):
     # Rendering / posting
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _as_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    @staticmethod
+    def _parse_color(value: Any) -> Optional[discord.Color]:
+        if value in (None, ''):
+            return None
+        try:
+            return discord.Color.from_str(str(value).strip())
+        except ValueError:
+            return None
+
+    def _appearance(self, guild_id: int) -> Dict[str, Any]:
+        """Resolve the guild's summary appearance, falling back to the defaults."""
+        config = self._guild_config(guild_id)
+        return {
+            'title': config.get(TITLE_KEY) or DEFAULT_SUMMARY_TITLE,
+            'description': config.get(DESCRIPTION_KEY) or "",
+            'footer': config.get(FOOTER_KEY) or DEFAULT_SUMMARY_FOOTER,
+            'color': config.get(COLOR_KEY),
+            'color_obj': self._parse_color(config.get(COLOR_KEY)) or discord.Color.blurple(),
+            'show_titles': self._as_bool(config.get(SHOW_TITLES_KEY), True),
+            'show_leaderboard': self._as_bool(config.get(SHOW_LEADERBOARD_KEY), True),
+        }
+
+    @staticmethod
+    def _summary_placeholders(day: date, stats: Dict[str, Any]) -> Dict[str, str]:
+        logs = stats.get('logs', 0) or 0
+        kizuna_logs = stats.get('kizuna_logs', 0) or 0
+        return {
+            'month': f"{day:%B}",
+            'day': str(day.day),
+            'year': str(day.year),
+            'date': f"{day:%B} {day.day}, {day.year}",
+            'total': _format_duration(stats.get('duration', 0)),
+            'logs': str(logs),
+            'users': str(stats.get('users', 0) or 0),
+            'reading': _format_duration(stats.get('reading_duration', 0)),
+            'listening': _format_duration(stats.get('listening_duration', 0)),
+            'kizuna_logs': str(kizuna_logs),
+            'manual_logs': str(max(0, logs - kizuna_logs)),
+        }
+
+    @staticmethod
+    def _solve(template: str, values: Dict[str, str], default: str = "") -> str:
+        """Render a template, falling back to ``default`` if a stored one is bad."""
+        try:
+            return template.format(**values)
+        except (KeyError, IndexError, ValueError):
+            logger.exception("Daily summary: invalid appearance template; using the default")
+            if not default:
+                return ""
+            try:
+                return default.format(**values)
+            except (KeyError, IndexError, ValueError):
+                return default
+
     async def _build_embed(self, guild: Optional[discord.Guild], day: date, stats: Dict[str, Any]) -> discord.Embed:
+        appearance = self._appearance(guild.id) if guild is not None else {
+            'title': DEFAULT_SUMMARY_TITLE,
+            'description': "",
+            'footer': DEFAULT_SUMMARY_FOOTER,
+            'color': None,
+            'color_obj': discord.Color.blurple(),
+            'show_titles': True,
+            'show_leaderboard': True,
+        }
+        values = self._summary_placeholders(day, stats)
+
+        title = self._solve(appearance['title'], values, DEFAULT_SUMMARY_TITLE)
+        if not title.strip():
+            title = DEFAULT_SUMMARY_TITLE.format(**values)
+        description = self._solve(appearance['description'], values) if appearance['description'] else ""
+        footer = self._solve(appearance['footer'], values) if appearance['footer'] else ""
+
         total = stats.get('duration', 0) or 0
         logs = stats.get('logs', 0) or 0
         users = stats.get('users', 0) or 0
@@ -158,8 +289,9 @@ class DailyLogSummaryCog(commands.Cog):
         manual_logs = max(0, logs - kizuna_logs)
 
         embed = discord.Embed(
-            title=f"📊 Daily Immersion Summary — {day:%B} {day.day}, {day.year}",
-            color=discord.Color.blurple(),
+            title=title[:256],
+            description=description[:4096] or None,
+            color=appearance['color_obj'],
         )
         embed.add_field(
             name="Overview",
@@ -174,7 +306,7 @@ class DailyLogSummaryCog(commands.Cog):
         )
 
         titles = stats.get('titles') or []
-        if titles:
+        if appearance['show_titles'] and titles:
             lines = []
             for entry in titles[:5]:
                 media = (entry.get('media_type') or entry.get('primary_type') or "").replace('_', ' ').title()
@@ -185,7 +317,7 @@ class DailyLogSummaryCog(commands.Cog):
             embed.add_field(name="📚 Most logged titles", value="\n".join(lines), inline=False)
 
         top_users = stats.get('top_users') or []
-        if top_users:
+        if appearance['show_leaderboard'] and top_users:
             lines = []
             for index, entry in enumerate(top_users[:3], 1):
                 medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"{index}.")
@@ -197,79 +329,9 @@ class DailyLogSummaryCog(commands.Cog):
                 )
             embed.add_field(name="🏆 Leaderboard", value="\n".join(lines), inline=False)
 
-        embed.set_footer(
-            text="Includes kizuna and manual logs. Days and times are UTC."
-        )
+        if footer:
+            embed.set_footer(text=footer[:2048])
         return embed
-
-    async def _congratulate_top(self, guild: discord.Guild, day: date, stats: Dict[str, Any]) -> None:
-        """Ping the day's #1 member (or everyone tied for #1) in the configured channel."""
-        top_users = stats.get('top_users') or []
-        if not top_users:
-            return
-
-        channel = (
-            self._configured_channel(guild, SUMMARY_PING_CHANNEL_KEY)
-            or self._configured_channel(guild, SUMMARY_CHANNEL_KEY)
-        )
-        if channel is None:
-            logger.warning(
-                "Daily summary: no congratulation channel configured for guild %s", guild.id
-            )
-            return
-
-        best_duration = int(top_users[0].get('duration', 0) or 0)
-        tied = [
-            entry for entry in top_users
-            if int(entry.get('duration', 0) or 0) == best_duration
-        ]
-
-        mentions = []
-        for entry in tied:
-            try:
-                user_id = int(entry['user_id'])
-            except (KeyError, TypeError, ValueError):
-                continue
-            # Only ping people who can actually see the message.
-            if guild.get_member(user_id) is None:
-                try:
-                    await guild.fetch_member(user_id)
-                except (discord.NotFound, discord.HTTPException):
-                    logger.info(
-                        "Daily summary: #1 user %s is not in guild %s; skipping the ping",
-                        user_id, guild.id,
-                    )
-                    continue
-            mentions.append(f"<@{user_id}>")
-
-        if not mentions:
-            return
-
-        if len(mentions) == 1:
-            who = mentions[0]
-        else:
-            who = ", ".join(mentions[:-1]) + f" and {mentions[-1]}"
-
-        template = (
-            self._guild_config(guild.id).get(SUMMARY_CONGRATS_KEY)
-            or DEFAULT_CONGRATS_MESSAGE
-        )
-        message = self._render_congrats(
-            template,
-            users=who,
-            duration=_format_duration(best_duration),
-            date=f"{day:%B} {day.day}",
-        )
-
-        try:
-            await channel.send(
-                message,
-                allowed_mentions=discord.AllowedMentions(users=True),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception(
-                "Daily summary: could not send the congratulation message in guild %s", guild.id
-            )
 
     @staticmethod
     def _render_congrats(template: str, **values: str) -> str:
@@ -282,8 +344,101 @@ class DailyLogSummaryCog(commands.Cog):
             )
             return DEFAULT_CONGRATS_MESSAGE.format(**values)
 
-    async def _post_for_guild(self, guild: discord.Guild, day: date, force: bool = False) -> bool:
-        """Post one guild's summary (and ping). Returns True when it was posted."""
+    def _parse_day(self, value: Optional[str]) -> Optional[date]:
+        """Parse an optional YYYY-MM-DD; default is the UTC day that just ended."""
+        if not value:
+            return (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    async def _stats_for_day(self, day: date) -> Optional[Dict[str, Any]]:
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        return await self._summary_for(start, start + timedelta(days=1))
+
+    async def _build_congrats_text(
+        self,
+        guild: discord.Guild,
+        day: date,
+        stats: Dict[str, Any],
+        *,
+        preview: bool = False,
+    ) -> Optional[str]:
+        """Render the #1 message.
+
+        ``preview`` uses bold display names instead of mentions so a preview can
+        never ping anybody.
+        """
+        top_users = stats.get('top_users') or []
+        if not top_users:
+            return None
+
+        best_duration = int(top_users[0].get('duration', 0) or 0)
+        tied = [
+            entry for entry in top_users
+            if int(entry.get('duration', 0) or 0) == best_duration
+        ]
+
+        names = []
+        for entry in tied:
+            try:
+                user_id = int(entry['user_id'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if preview:
+                names.append(f"**{await self._display_name(guild, user_id)}**")
+                continue
+            # Only ping people who can actually see the message.
+            if guild.get_member(user_id) is None:
+                try:
+                    await guild.fetch_member(user_id)
+                except (discord.NotFound, discord.HTTPException):
+                    logger.info(
+                        "Daily summary: #1 user %s is not in guild %s; skipping the ping",
+                        user_id, guild.id,
+                    )
+                    continue
+            names.append(f"<@{user_id}>")
+
+        if not names:
+            return None
+
+        who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+        template = (
+            self._guild_config(guild.id).get(SUMMARY_CONGRATS_KEY)
+            or DEFAULT_CONGRATS_MESSAGE
+        )
+        return self._render_congrats(
+            template,
+            users=who,
+            duration=_format_duration(best_duration),
+            date=f"{day:%B} {day.day}",
+        )
+
+    async def _build_no_log_embed(self, guild: discord.Guild, day: date, stats: Dict[str, Any]) -> discord.Embed:
+        appearance = self._appearance(guild.id)
+        values = self._summary_placeholders(day, stats)
+        title = self._solve(appearance['title'], values, DEFAULT_SUMMARY_TITLE)
+        if not title.strip():
+            title = DEFAULT_SUMMARY_TITLE.format(**values)
+        embed = discord.Embed(
+            title=title[:256],
+            description="No immersion logs were recorded.",
+            color=appearance['color_obj'],
+        )
+        footer = self._solve(appearance['footer'], values) if appearance['footer'] else ""
+        if footer:
+            embed.set_footer(text=footer[:2048])
+        return embed
+
+    async def _build_summary_embed(self, guild: discord.Guild, day: date, stats: Dict[str, Any]) -> discord.Embed:
+        if stats.get('logs', 0):
+            return await self._build_embed(guild, day, stats)
+        return await self._build_no_log_embed(guild, day, stats)
+
+    async def _post_summary(self, guild: discord.Guild, day: date, stats: Dict[str, Any], force: bool = False) -> bool:
+        """Post only the summary embed. Returns True when it was posted."""
         channel = self._configured_channel(guild, SUMMARY_CHANNEL_KEY)
         if channel is None:
             logger.debug(
@@ -292,25 +447,11 @@ class DailyLogSummaryCog(commands.Cog):
             return False
 
         day_key = day.isoformat()
-        if not force and self._posted_days.get(str(guild.id)) == day_key:
-            logger.debug("Daily summary: %s already posted for guild %s", day_key, guild.id)
+        if not force and self._posted_summary.get(str(guild.id)) == day_key:
+            logger.debug("Daily summary: summary %s already posted for guild %s", day_key, guild.id)
             return False
 
-        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=1)
-        stats = await self._summary_for(start, end)
-        if stats is None:
-            return False
-
-        if stats.get('logs', 0):
-            embed = await self._build_embed(guild, day, stats)
-        else:
-            embed = discord.Embed(
-                title=f"📊 Daily Immersion Summary — {day:%B} {day.day}, {day.year}",
-                description="No immersion logs were recorded.",
-                color=discord.Color.dark_grey(),
-            )
-
+        embed = await self._build_summary_embed(guild, day, stats)
         try:
             await channel.send(
                 embed=embed,
@@ -323,11 +464,54 @@ class DailyLogSummaryCog(commands.Cog):
             )
             return False
 
-        await self._congratulate_top(guild, day, stats)
-
-        self._posted_days[str(guild.id)] = day_key
+        self._posted_summary[str(guild.id)] = day_key
         self._save_state()
         return True
+
+    async def _post_congrats(self, guild: discord.Guild, day: date, stats: Dict[str, Any], force: bool = False) -> bool:
+        """Send only the #1 congratulation. Returns True when it was sent."""
+        day_key = day.isoformat()
+        if not force and self._posted_congrats.get(str(guild.id)) == day_key:
+            logger.debug("Daily summary: congrats %s already sent for guild %s", day_key, guild.id)
+            return False
+
+        channel = (
+            self._configured_channel(guild, SUMMARY_PING_CHANNEL_KEY)
+            or self._configured_channel(guild, SUMMARY_CHANNEL_KEY)
+        )
+        if channel is None:
+            logger.warning(
+                "Daily summary: no congratulation channel configured for guild %s", guild.id
+            )
+            return False
+
+        message = await self._build_congrats_text(guild, day, stats)
+        if message is None:
+            return False
+
+        try:
+            await channel.send(
+                message,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Daily summary: could not send the congratulation message in guild %s", guild.id
+            )
+            return False
+
+        self._posted_congrats[str(guild.id)] = day_key
+        self._save_state()
+        return True
+
+    async def _post_for_guild(self, guild: discord.Guild, day: date, force: bool = False) -> bool:
+        """Full scheduled post: the summary followed by the #1 congratulation."""
+        stats = await self._stats_for_day(day)
+        if stats is None:
+            return False
+        posted = await self._post_summary(guild, day, stats, force=force)
+        await self._post_congrats(guild, day, stats, force=force)
+        return posted
 
     # ------------------------------------------------------------------
     # Scheduled run
@@ -348,27 +532,31 @@ class DailyLogSummaryCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ------------------------------------------------------------------
-    # Admin command
+    # Summary admin command
     # ------------------------------------------------------------------
 
     @app_commands.command(
         name="manage_daily_summary",
-        description="[ADMIN] Configure or test the daily immersion log summary",
+        description="[ADMIN] Configure, run or test the daily immersion summary",
     )
     @app_commands.describe(
         action="What to do.",
-        summary_channel="(setup/set_summary_channel) Channel for the daily summary embed.",
-        ping_channel="(setup/set_ping_channel) Channel for the #1 congratulation ping.",
-        date="(run) Day to summarise as YYYY-MM-DD. Defaults to yesterday (UTC).",
-        message="(set_congrats_message) Template with {users}, {duration}, {date}. Server emoji allowed. Omit to reset.",
+        channel="(setup/set_channel) Where the summary is posted. Omit on set_channel to clear.",
+        date="(run/test) Day as YYYY-MM-DD. Defaults to yesterday (UTC).",
+        title="(setup) Embed title template.",
+        description="(setup) Embed description template; empty clears it.",
+        footer="(setup) Embed footer template.",
+        color="(setup) Embed colour as #RRGGBB.",
+        show_titles="(setup) Show the 'Most logged titles' section.",
+        show_leaderboard="(setup) Show the 'Leaderboard' section.",
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="setup", value="setup"),
-        app_commands.Choice(name="Set summary channel", value="set_summary_channel"),
-        app_commands.Choice(name="Set congratulation channel", value="set_ping_channel"),
-        app_commands.Choice(name="Set congratulation message", value="set_congrats_message"),
+        app_commands.Choice(name="Set channel", value="set_channel"),
+        app_commands.Choice(name="Reset style", value="reset_style"),
         app_commands.Choice(name="status", value="status"),
         app_commands.Choice(name="run", value="run"),
+        app_commands.Choice(name="test", value="test"),
     ])
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -377,133 +565,225 @@ class DailyLogSummaryCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         action: str,
-        summary_channel: Optional[discord.TextChannel] = None,
-        ping_channel: Optional[discord.TextChannel] = None,
+        channel: Optional[discord.TextChannel] = None,
         date: Optional[str] = None,
-        message: Optional[str] = None,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        footer: Optional[str] = None,
+        color: Optional[str] = None,
+        show_titles: Optional[bool] = None,
+        show_leaderboard: Optional[bool] = None,
     ):
         if action == "status":
-            await self._show_status(interaction)
+            await self._show_summary_status(interaction)
             return
 
         if action == "run":
-            await self._run_now(interaction, date)
+            await self._run_summary(interaction, date)
             return
 
-        if action == "set_congrats_message":
-            await self._set_congrats_message(interaction, message)
+        if action == "test":
+            await self._test_summary(interaction, date)
             return
 
-        if action == "setup":
-            await self._set_channels(interaction, summary_channel, ping_channel)
+        if action == "reset_style":
+            await self._reset_style(interaction)
             return
 
-        if action == "set_summary_channel":
-            # Omitting the channel clears it, which is how the summary is turned off.
-            await self._set_channels(
-                interaction, summary_channel, None, clear_summary=summary_channel is None
+        if action == "set_channel":
+            await self._set_summary_settings(
+                interaction, channel, clear_channel=channel is None
             )
             return
 
-        # set_ping_channel: omitting the channel falls back to the summary channel.
-        await self._set_channels(
-            interaction, None, ping_channel, clear_ping=ping_channel is None
+        await self._set_summary_settings(
+            interaction,
+            channel,
+            title=title,
+            description=description,
+            footer=footer,
+            color=color,
+            show_titles=show_titles,
+            show_leaderboard=show_leaderboard,
         )
 
-    async def _set_channels(
+    async def _set_summary_settings(
         self,
         interaction: discord.Interaction,
-        summary_channel: Optional[discord.TextChannel],
-        ping_channel: Optional[discord.TextChannel],
+        channel: Optional[discord.TextChannel] = None,
         *,
-        clear_summary: bool = False,
-        clear_ping: bool = False,
-    ):
-        """Update the summary and/or congratulation channels independently."""
-        config = self.bot.config.setdefault('guilds', {}).setdefault(
-            str(interaction.guild.id), {}
-        )
-        changes = []
+        clear_channel: bool = False,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        footer: Optional[str] = None,
+        color: Optional[str] = None,
+        show_titles: Optional[bool] = None,
+        show_leaderboard: Optional[bool] = None,
+    ) -> None:
+        """Validate every supplied value first, then apply them all in one save."""
+        # (config key, value, human readable change); value None means "remove".
+        pending = []
 
-        if summary_channel is not None:
-            config[SUMMARY_CHANNEL_KEY] = str(summary_channel.id)
-            changes.append(f"Summary channel set to {summary_channel.mention}")
-        elif clear_summary:
-            config.pop(SUMMARY_CHANNEL_KEY, None)
-            changes.append("Summary channel cleared (the daily summary is now off)")
+        if channel is not None:
+            pending.append((SUMMARY_CHANNEL_KEY, str(channel.id), f"Channel set to {channel.mention}"))
+        elif clear_channel:
+            pending.append((
+                SUMMARY_CHANNEL_KEY, None,
+                "Channel cleared (the daily summary is now off)",
+            ))
 
-        if ping_channel is not None:
-            config[SUMMARY_PING_CHANNEL_KEY] = str(ping_channel.id)
-            changes.append(f"#1 congratulation channel set to {ping_channel.mention}")
-        elif clear_ping:
-            config.pop(SUMMARY_PING_CHANNEL_KEY, None)
-            changes.append(
-                "#1 congratulation channel cleared (the ping will use the summary channel)"
-            )
+        if title is not None:
+            text = title.strip()
+            if not text:
+                await interaction.response.send_message(
+                    "❌ `title` cannot be empty. Use `action:reset_style` to restore the default.",
+                    ephemeral=True,
+                )
+                return
+            if len(text) > 256:
+                await interaction.response.send_message(
+                    "❌ `title` must be 256 characters or fewer.", ephemeral=True
+                )
+                return
+            error = self._template_error(text)
+            if error:
+                await interaction.response.send_message(
+                    f"❌ Invalid `title` template ({error}).", ephemeral=True
+                )
+                return
+            pending.append((TITLE_KEY, text, "Title updated"))
 
-        if not changes:
+        if description is not None:
+            text = description.strip()
+            if not text:
+                pending.append((DESCRIPTION_KEY, None, "Description cleared"))
+            else:
+                if len(text) > 4096:
+                    await interaction.response.send_message(
+                        "❌ `description` must be 4096 characters or fewer.", ephemeral=True
+                    )
+                    return
+                error = self._template_error(text)
+                if error:
+                    await interaction.response.send_message(
+                        f"❌ Invalid `description` template ({error}).", ephemeral=True
+                    )
+                    return
+                pending.append((DESCRIPTION_KEY, text, "Description updated"))
+
+        if footer is not None:
+            text = footer.strip()
+            if not text:
+                await interaction.response.send_message(
+                    "❌ `footer` cannot be empty. Use `action:reset_style` to restore the default.",
+                    ephemeral=True,
+                )
+                return
+            if len(text) > 2048:
+                await interaction.response.send_message(
+                    "❌ `footer` must be 2048 characters or fewer.", ephemeral=True
+                )
+                return
+            error = self._template_error(text)
+            if error:
+                await interaction.response.send_message(
+                    f"❌ Invalid `footer` template ({error}).", ephemeral=True
+                )
+                return
+            pending.append((FOOTER_KEY, text, "Footer updated"))
+
+        if color is not None:
+            parsed = self._parse_color(color)
+            if parsed is None:
+                await interaction.response.send_message(
+                    "❌ `color` must be a hex value like `#5865F2`.", ephemeral=True
+                )
+                return
+            normalized = f"#{parsed.value:06x}"
+            pending.append((COLOR_KEY, normalized, f"Colour set to `{normalized}`"))
+
+        if show_titles is not None:
+            pending.append((
+                SHOW_TITLES_KEY, bool(show_titles),
+                f"Titles section {'shown' if show_titles else 'hidden'}",
+            ))
+
+        if show_leaderboard is not None:
+            pending.append((
+                SHOW_LEADERBOARD_KEY, bool(show_leaderboard),
+                f"Leaderboard section {'shown' if show_leaderboard else 'hidden'}",
+            ))
+
+        if not pending:
             await interaction.response.send_message(
-                "Nothing to change — pass `summary_channel` and/or `ping_channel`.",
+                "Nothing to change — pass a channel and/or at least one style option.",
                 ephemeral=True,
             )
             return
 
+        config = self.bot.config.setdefault('guilds', {}).setdefault(
+            str(interaction.guild.id), {}
+        )
+        for key, value, _ in pending:
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
         self.bot.save_config()
 
+        appearance = self._appearance(interaction.guild.id)
+        values = SAMPLE_PLACEHOLDER_VALUES
+        preview_lines = [
+            f"**Title:** {self._solve(appearance['title'], values, DEFAULT_SUMMARY_TITLE)}",
+            f"**Description:** {self._solve(appearance['description'], values) or '_(none)_'}",
+            f"**Footer:** {self._solve(appearance['footer'], values) or '_(none)_'}",
+        ]
         embed = discord.Embed(
-            title="✅ Daily summary channels updated",
-            description="\n".join(f"• {change}" for change in changes),
-            color=discord.Color.green(),
+            title="✅ Daily summary updated",
+            description="\n".join(f"• {change}" for _, _, change in pending),
+            color=appearance['color_obj'],
         )
-        summary_id = config.get(SUMMARY_CHANNEL_KEY)
-        ping_id = config.get(SUMMARY_PING_CHANNEL_KEY)
-        if summary_id and ping_id and str(summary_id) == str(ping_id):
-            embed.add_field(
-                name="ℹ️ Same channel",
-                value="Both are set to the same channel, so the #1 ping will appear "
-                      "there too. Pass a different `ping_channel` to separate them.",
-                inline=False,
-            )
+        embed.add_field(name="🧪 Preview", value="\n".join(preview_lines)[:1024], inline=False)
+        embed.add_field(name="ℹ️ Placeholders", value=SUMMARY_PLACEHOLDERS_HINT, inline=False)
+        embed.set_footer(
+            text="Run /manage_daily_summary action:test for a private preview of the real embed."
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def _show_status(self, interaction: discord.Interaction):
+    async def _show_summary_status(self, interaction: discord.Interaction):
         guild = interaction.guild
         summary_channel = self._configured_channel(guild, SUMMARY_CHANNEL_KEY)
-        ping_channel = self._configured_channel(guild, SUMMARY_PING_CHANNEL_KEY)
-        last_posted = self._posted_days.get(str(guild.id))
+        appearance = self._appearance(guild.id)
+        values = SAMPLE_PLACEHOLDER_VALUES
 
         lines = [
-            f"**Summary channel:** {summary_channel.mention if summary_channel else 'not set'}",
-            f"**Congratulation channel:** {ping_channel.mention if ping_channel else '(same as the summary channel)'}",
-            f"**Schedule:** daily at **00:05 UTC** (summarises the UTC day that just ended)",
-            f"**Last posted:** {last_posted or 'never'}",
+            f"**Channel:** {summary_channel.mention if summary_channel else 'not set'}",
+            "**Schedule:** daily at **00:05 UTC** (summarises the UTC day that just ended)",
+            f"**Last posted:** {self._posted_summary.get(str(guild.id)) or 'never'}",
+            f"**Title:** {self._solve(appearance['title'], values, DEFAULT_SUMMARY_TITLE)}",
+            f"**Description:** {self._solve(appearance['description'], values) or '_(none)_'}",
+            f"**Footer:** {self._solve(appearance['footer'], values) or '_(none)_'}",
+            f"**Colour:** {appearance['color'] or 'default (blurple)'}",
+            f"**Titles section:** {'on' if appearance['show_titles'] else 'off'}",
+            f"**Leaderboard section:** {'on' if appearance['show_leaderboard'] else 'off'}",
         ]
-        if summary_channel and ping_channel and summary_channel.id == ping_channel.id:
-            lines.append("⚠️ Both are set to the **same** channel.")
         embed = discord.Embed(
-            title="📊 Daily Log Summary",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
+            title="📊 Daily immersion summary",
+            description="\n".join(lines)[:4096],
+            color=appearance['color_obj'],
         )
         embed.add_field(
             name="ℹ️ What it includes",
             value="All immersion logs for the day — kizuna auto-logs and manual "
-                  "`/log_*` submissions. The #1 member by time is pinged in the "
-                  "congratulation channel.",
+                  "`/log_*` submissions. The #1 ping is separate; see "
+                  "`/manage_daily_congrats`.",
             inline=False,
         )
+        embed.add_field(name="ℹ️ Placeholders", value=SUMMARY_PLACEHOLDERS_HINT, inline=False)
         embed.add_field(
             name="🧪 Test",
-            value="`/manage_daily_summary action:run` posts yesterday's summary now.",
-            inline=False,
-        )
-        template = (
-            self._guild_config(guild.id).get(SUMMARY_CONGRATS_KEY)
-            or DEFAULT_CONGRATS_MESSAGE
-        )
-        embed.add_field(
-            name="💬 Congratulation message",
-            value="```" + template[:800] + "```\n" + CONGRATS_PLACEHOLDERS_HINT,
+            value="`/manage_daily_summary action:test` shows a private preview — "
+                  "nothing is posted.",
             inline=False,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -571,28 +851,316 @@ class DailyLogSummaryCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    async def _run_now(self, interaction: discord.Interaction, day_value: Optional[str]):
-        await interaction.response.defer(ephemeral=True)
-        day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-        if day_value:
-            try:
-                day = datetime.strptime(day_value.strip(), "%Y-%m-%d").date()
-            except ValueError:
-                await interaction.followup.send(
-                    "❌ `date` must be in YYYY-MM-DD format.", ephemeral=True
+    # ------------------------------------------------------------------
+    # #1 congratulation admin command
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="manage_daily_congrats",
+        description="[ADMIN] Configure, run or test the daily #1 congratulation ping",
+    )
+    @app_commands.describe(
+        action="What to do.",
+        channel="(set_channel) Where the ping is sent. Omit to fall back to the summary channel.",
+        message="(set_message) Template with {users}, {duration}, {date}. Server emoji allowed. Omit to reset.",
+        date="(run/test) Day as YYYY-MM-DD. Defaults to yesterday (UTC).",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Set channel", value="set_channel"),
+        app_commands.Choice(name="Set message", value="set_message"),
+        app_commands.Choice(name="status", value="status"),
+        app_commands.Choice(name="run", value="run"),
+        app_commands.Choice(name="test", value="test"),
+    ])
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def manage_daily_congrats(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        channel: Optional[discord.TextChannel] = None,
+        message: Optional[str] = None,
+        date: Optional[str] = None,
+    ):
+        if action == "status":
+            await self._show_congrats_status(interaction)
+            return
+
+        if action == "run":
+            await self._run_congrats(interaction, date)
+            return
+
+        if action == "test":
+            await self._test_congrats(interaction, date)
+            return
+
+        if action == "set_message":
+            await self._set_congrats_message(interaction, message)
+            return
+
+        await self._set_congrats_channel(interaction, channel)
+
+    async def _set_congrats_channel(
+        self, interaction: discord.Interaction, channel: Optional[discord.TextChannel]
+    ):
+        """Set the congratulation channel, or clear it to fall back to the summary channel."""
+        config = self.bot.config.setdefault('guilds', {}).setdefault(
+            str(interaction.guild.id), {}
+        )
+
+        if channel is None:
+            if SUMMARY_PING_CHANNEL_KEY not in config:
+                await interaction.response.send_message(
+                    "ℹ️ The #1 ping already uses the summary channel. "
+                    "Pass `channel` to give it its own channel.",
+                    ephemeral=True,
                 )
                 return
-
-        posted = await self._post_for_guild(interaction.guild, day, force=True)
-        if posted:
-            await interaction.followup.send(
-                f"✅ Posted the summary for **{day.isoformat()}**.", ephemeral=True
+            config.pop(SUMMARY_PING_CHANNEL_KEY, None)
+            self.bot.save_config()
+            await interaction.response.send_message(
+                "✅ Congratulation channel cleared — the ping will use the summary channel.",
+                ephemeral=True,
             )
-        elif self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY) is None:
+            return
+
+        config[SUMMARY_PING_CHANNEL_KEY] = str(channel.id)
+        self.bot.save_config()
+
+        summary_channel = self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY)
+        embed = discord.Embed(
+            title="✅ Congratulation channel updated",
+            description=f"• #1 congratulation channel set to {channel.mention}",
+            color=discord.Color.green(),
+        )
+        if summary_channel is not None and summary_channel.id == channel.id:
+            embed.add_field(
+                name="ℹ️ Same channel",
+                value="This is also the summary channel, so both messages appear there.",
+                inline=False,
+            )
+        embed.set_footer(text="Omit `channel` to fall back to the summary channel.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @staticmethod
+    def _template_error(template: str) -> Optional[str]:
+        """Return why a template cannot be rendered, or None when it is valid."""
+        try:
+            template.format(**SAMPLE_PLACEHOLDER_VALUES)
+            return None
+        except (KeyError, IndexError, ValueError) as exc:
+            return str(exc).strip("'\"") or "malformed braces"
+
+    async def _show_congrats_status(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = self._configured_channel(guild, SUMMARY_PING_CHANNEL_KEY)
+        fallback = self._configured_channel(guild, SUMMARY_CHANNEL_KEY)
+        if channel is not None:
+            target = channel.mention
+        elif fallback is not None:
+            target = f"(same as the summary channel — {fallback.mention})"
+        else:
+            target = "not set"
+
+        template = (
+            self._guild_config(guild.id).get(SUMMARY_CONGRATS_KEY)
+            or DEFAULT_CONGRATS_MESSAGE
+        )
+        lines = [
+            f"**Channel:** {target}",
+            "**Schedule:** daily at **00:05 UTC**, right after the summary",
+            f"**Last sent:** {self._posted_congrats.get(str(guild.id)) or 'never'}",
+        ]
+        embed = discord.Embed(
+            title="🏆 Daily #1 congratulation",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        embed.add_field(
+            name="💬 Message",
+            value="```" + template[:800] + "```\n" + CONGRATS_PLACEHOLDERS_HINT,
+            inline=False,
+        )
+        embed.add_field(
+            name="🧪 Test",
+            value="`/manage_daily_congrats action:test` shows a private preview — "
+                  "nobody is pinged.",
+            inline=False,
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _run_congrats(self, interaction: discord.Interaction, day_value: Optional[str]):
+        """Send the real #1 congratulation now."""
+        await interaction.response.defer(ephemeral=True)
+        day = self._parse_day(day_value)
+        if day is None:
+            await interaction.followup.send(
+                "❌ `date` must be in YYYY-MM-DD format.", ephemeral=True
+            )
+            return
+
+        stats = await self._stats_for_day(day)
+        if stats is None:
+            await interaction.followup.send(
+                "❌ Could not read the activity data. Check the bot log for the reason.",
+                ephemeral=True,
+            )
+            return
+
+        channel = (
+            self._configured_channel(interaction.guild, SUMMARY_PING_CHANNEL_KEY)
+            or self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY)
+        )
+        if channel is None:
+            await interaction.followup.send(
+                "❌ No congratulation channel is set. Use "
+                "`/manage_daily_congrats action:set_channel channel:#channel` first.",
+                ephemeral=True,
+            )
+            return
+
+        if not (stats.get('top_users') or []):
+            await interaction.followup.send(
+                f"ℹ️ There were no immersion logs on **{day.isoformat()}**, so there is "
+                "nobody to congratulate.",
+                ephemeral=True,
+            )
+            return
+
+        sent = await self._post_congrats(interaction.guild, day, stats, force=True)
+        if sent:
+            await interaction.followup.send(
+                f"✅ Sent the #1 congratulation for **{day.isoformat()}** in "
+                f"{channel.mention}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.followup.send(
+                "❌ Could not send the congratulation message. Check the bot log for the "
+                "reason (usually a missing Send Messages permission, or the #1 member "
+                "has left the server).",
+                ephemeral=True,
+            )
+
+    async def _test_congrats(self, interaction: discord.Interaction, day_value: Optional[str]):
+        """Private preview of the #1 message. Never sends or pings anything."""
+        await interaction.response.defer(ephemeral=True)
+        day = self._parse_day(day_value)
+        if day is None:
+            await interaction.followup.send(
+                "❌ `date` must be in YYYY-MM-DD format.", ephemeral=True
+            )
+            return
+
+        stats = await self._stats_for_day(day)
+        preview = None
+        note = None
+        if stats is not None:
+            preview = await self._build_congrats_text(
+                interaction.guild, day, stats, preview=True
+            )
+        if preview is None:
+            # No logs, or nobody eligible: render the template with sample numbers so
+            # the formatting can still be checked.
+            template = (
+                self._guild_config(interaction.guild.id).get(SUMMARY_CONGRATS_KEY)
+                or DEFAULT_CONGRATS_MESSAGE
+            )
+            preview = self._render_congrats(
+                template,
+                users=f"**{interaction.user.display_name}**",
+                duration="2h 15m",
+                date=f"{day:%B} {day.day}",
+            )
+            note = (
+                f"No immersion logs were found for **{day.isoformat()}**, so this "
+                "preview uses your name and sample numbers."
+            )
+
+        channel = (
+            self._configured_channel(interaction.guild, SUMMARY_PING_CHANNEL_KEY)
+            or self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY)
+        )
+        embed = discord.Embed(
+            title="🧪 Preview — #1 congratulation",
+            description=preview[:4096],
+            color=discord.Color.gold(),
+        )
+        if note:
+            embed.add_field(name="ℹ️ Note", value=note, inline=False)
+        embed.add_field(
+            name="📤 Would be sent to",
+            value=channel.mention if channel else "❌ no channel configured",
+            inline=False,
+        )
+        embed.set_footer(text="Preview only — nothing was posted and nobody was pinged.")
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _reset_style(self, interaction: discord.Interaction):
+        config = self.bot.config.setdefault('guilds', {}).setdefault(
+            str(interaction.guild.id), {}
+        )
+        removed = []
+        for key in (
+            TITLE_KEY, DESCRIPTION_KEY, FOOTER_KEY, COLOR_KEY,
+            SHOW_TITLES_KEY, SHOW_LEADERBOARD_KEY,
+        ):
+            if key in config:
+                config.pop(key, None)
+                removed.append(key)
+        if removed:
+            self.bot.save_config()
+            await interaction.response.send_message(
+                "✅ Daily summary style reset to the defaults.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "ℹ️ The daily summary is already using the default style.", ephemeral=True
+            )
+
+    async def _run_summary(self, interaction: discord.Interaction, day_value: Optional[str]):
+        """Post the real summary embed now."""
+        await interaction.response.defer(ephemeral=True)
+        day = self._parse_day(day_value)
+        if day is None:
+            await interaction.followup.send(
+                "❌ `date` must be in YYYY-MM-DD format.", ephemeral=True
+            )
+            return
+
+        channel = self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY)
+        if channel is None:
             await interaction.followup.send(
                 "❌ No summary channel is set. Use "
                 "`/manage_daily_summary action:set_channel channel:#channel` first.",
                 ephemeral=True,
+            )
+            return
+
+        stats = await self._stats_for_day(day)
+        if stats is None:
+            await interaction.followup.send(
+                "❌ Could not read the activity data. Check the bot log for the reason.",
+                ephemeral=True,
+            )
+            return
+
+        posted = await self._post_summary(interaction.guild, day, stats, force=True)
+        if posted:
+            await interaction.followup.send(
+                f"✅ Posted the summary for **{day.isoformat()}** in {channel.mention}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         else:
             await interaction.followup.send(
@@ -600,6 +1168,43 @@ class DailyLogSummaryCog(commands.Cog):
                 "(usually missing Send Messages / Embed Links permission).",
                 ephemeral=True,
             )
+
+    async def _test_summary(self, interaction: discord.Interaction, day_value: Optional[str]):
+        """Private preview of the summary embed. Never posts anything."""
+        await interaction.response.defer(ephemeral=True)
+        day = self._parse_day(day_value)
+        if day is None:
+            await interaction.followup.send(
+                "❌ `date` must be in YYYY-MM-DD format.", ephemeral=True
+            )
+            return
+
+        stats = await self._stats_for_day(day)
+        if stats is None:
+            await interaction.followup.send(
+                "❌ Could not read the activity data. Check the bot log for the reason.",
+                ephemeral=True,
+            )
+            return
+
+        embed = await self._build_summary_embed(interaction.guild, day, stats)
+        channel = self._configured_channel(interaction.guild, SUMMARY_CHANNEL_KEY)
+        lines = ["🧪 **Preview only** — nothing was posted and nobody was pinged."]
+        lines.append(
+            f"📤 Would be posted to {channel.mention}."
+            if channel else "📤 No summary channel is configured yet."
+        )
+        if not stats.get('logs', 0):
+            lines.append(
+                f"ℹ️ No immersion logs were found for **{day.isoformat()}**, so this is "
+                "the empty-day variant."
+            )
+        await interaction.followup.send(
+            content="\n".join(lines),
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 async def setup(bot):

@@ -989,13 +989,26 @@ class CommandsCog(commands.Cog):
             },
             "manage_daily_summary": {
                 "category": "⚙️ Admin Commands",
-                "usage": "/manage_daily_summary action:<setup|set_summary_channel|set_ping_channel|set_congrats_message|status|run> [summary_channel:<#channel>] [ping_channel:<#channel>] [message:<template>] [date:<YYYY-MM-DD>]",
-                "description": "Configure or test the daily immersion log summary",
-                "details": "setup sets both channels at once; set_summary_channel sets where the daily summary (kizuna + manual logs) is posted; set_ping_channel sets where the #1 congratulations ping goes (falls back to the summary channel); set_congrats_message sets the congratulation text (placeholders {users}, {duration}, {date}, server emoji allowed); run posts a day on demand.",
+                "usage": "/manage_daily_summary action:<setup|set_channel|reset_style|status|run|test> [channel:<#channel>] [date:<YYYY-MM-DD>] [title:<template>] [description:<template>] [footer:<template>] [color:<#RRGGBB>] [show_titles:<bool>] [show_leaderboard:<bool>]",
+                "description": "Configure, post or preview the daily immersion summary",
+                "details": "setup sets the channel and any style options in one go; set_channel changes (or, with no channel, clears) where the summary is posted; reset_style restores the default look; status shows the current settings; run posts a day's summary now; test shows a private preview only you can see (nothing is posted). Templates support {month}, {day}, {year}, {date}, {total}, {logs}, {users}, {reading}, {listening}, {kizuna_logs}, {manual_logs} and server emoji.",
                 "examples": [
-                    "/manage_daily_summary action:setup summary_channel:#immersion ping_channel:#general",
-                    "/manage_daily_summary action:set_ping_channel ping_channel:#general",
-                    "/manage_daily_summary action:set_congrats_message message:🎉 Congrats {users}! Top spot on {date} with {duration} <:poggers:123456789>"
+                    "/manage_daily_summary action:setup channel:#immersion title:📊 {month} recap color:#5865F2",
+                    "/manage_daily_summary action:set_channel channel:#immersion",
+                    "/manage_daily_summary action:test",
+                    "/manage_daily_summary action:run date:2026-11-18"
+                ],
+                "admin_only": True
+            },
+            "manage_daily_congrats": {
+                "category": "⚙️ Admin Commands",
+                "usage": "/manage_daily_congrats action:<set_channel|set_message|status|run|test> [channel:<#channel>] [message:<template>] [date:<YYYY-MM-DD>]",
+                "description": "Configure, send or preview the #1 congratulation ping",
+                "details": "set_channel sets where the ping goes (omit the channel to fall back to the summary channel); set_message sets the text (omit it to reset to the default; placeholders {users}, {duration}, {date}, server emoji allowed); status shows the current setup; run sends the ping for a day now; test shows a private preview with no actual ping.",
+                "examples": [
+                    "/manage_daily_congrats action:set_channel channel:#general",
+                    "/manage_daily_congrats action:set_message message:🎉 Congrats {users}! Top spot on {date} with {duration} <:poggers:123456789>",
+                    "/manage_daily_congrats action:test"
                 ],
                 "admin_only": True
             },
