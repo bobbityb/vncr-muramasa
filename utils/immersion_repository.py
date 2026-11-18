@@ -781,7 +781,7 @@ class ActivityRepository:
                     GROUP BY user_id
                     HAVING duration > 0
                     ORDER BY duration DESC, user_id ASC
-                    LIMIT 5
+                    LIMIT 10
                     """,
                     params,
                 ) as cursor:

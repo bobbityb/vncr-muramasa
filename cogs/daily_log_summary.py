@@ -308,10 +308,7 @@ class DailyLogSummaryCog(commands.Cog):
         overview = [
             f"**Logged time:** {_format_duration(total)}",
             f"**Logs:** {logs} from {users} member{'s' if users != 1 else ''}",
-            (
-                f"**Reading:** {_format_duration(stats.get('reading_duration', 0))} • "
-                f"**Listening:** {_format_duration(stats.get('listening_duration', 0))}"
-            ),
+            f"**Reading:** {_format_duration(stats.get('reading_duration', 0))}",
         ]
         if appearance['show_characters']:
             overview.append(f"**Characters read:** {_format_count(stats.get('characters', 0))}")
@@ -332,17 +329,18 @@ class DailyLogSummaryCog(commands.Cog):
         if appearance['show_titles'] and titles:
             lines = []
             for entry in titles[:5]:
-                media = (entry.get('media_type') or entry.get('primary_type') or "").replace('_', ' ').title()
+                media_type = (entry.get('media_type') or "").strip().lower()
                 line = f"• **{entry.get('name') or 'Unknown'}** — {_format_duration(entry.get('duration', 0))}"
-                if media:
-                    line += f" ({media})"
+                # Visual novels are the norm here, so only label other media.
+                if media_type and media_type != 'visual_novel':
+                    line += f" ({media_type.replace('_', ' ').title()})"
                 lines.append(line)
             embed.add_field(name="📚 Most logged titles", value="\n".join(lines), inline=False)
 
         top_users = stats.get('top_users') or []
         if appearance['show_leaderboard'] and top_users:
             lines = []
-            for index, entry in enumerate(top_users[:3], 1):
+            for index, entry in enumerate(top_users[:10], 1):
                 medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"{index}.")
                 name = await self._display_name(guild, entry.get('user_id'))
                 entry_logs = entry.get('logs', 0) or 0
@@ -350,7 +348,7 @@ class DailyLogSummaryCog(commands.Cog):
                     f"{medal} **{name}** — {_format_duration(entry.get('duration', 0))} "
                     f"({entry_logs} log{'s' if entry_logs != 1 else ''})"
                 )
-            embed.add_field(name="🏆 Leaderboard", value="\n".join(lines), inline=False)
+            embed.add_field(name="🏆 Leaderboard", value="\n".join(lines)[:1024], inline=False)
 
         if footer:
             embed.set_footer(text=footer[:2048])
