@@ -153,6 +153,7 @@ class VnOfMonthCog(commands.Cog):
         max_days="Maximum acceptable window in days (default 84).",
         assume_chars_per_hour="Override the measured server pace (moji/hour).",
         assume_session_hours="Override the measured session length (hours per active day).",
+        public="Post the result in the channel instead of only showing it to you (default: private).",
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -166,17 +167,22 @@ class VnOfMonthCog(commands.Cog):
         max_days: Optional[app_commands.Range[int, 7, 365]] = None,
         assume_chars_per_hour: Optional[app_commands.Range[int, 1000, 200000]] = None,
         assume_session_hours: Optional[app_commands.Range[float, 0.25, 12.0]] = None,
+        public: Optional[bool] = None,
     ):
-        await interaction.response.defer(ephemeral=True)
-
+        # Validated before acknowledging so this error can stay private even when
+        # the result itself is going to be posted publicly.
         resolved = extract_vndb_id(vndb_id) or extract_vndb_id(f"v{vndb_id.strip()}")
         if not resolved:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "❌ That doesn't look like a VNDB id. Try `v38511` or "
                 "`https://vndb.org/v38511`.",
                 ephemeral=True,
             )
             return
+
+        # Private by default; `public:true` posts the estimate in the channel.
+        ephemeral = not public
+        await interaction.response.defer(ephemeral=ephemeral)
 
         defaults = DurationParams()
         params = DurationParams(
@@ -190,7 +196,7 @@ class VnOfMonthCog(commands.Cog):
         if not vn_data and not jiten_info:
             await interaction.followup.send(
                 f"❌ Could not find **{resolved}** on VNDB or jiten.moe.",
-                ephemeral=True,
+                ephemeral=ephemeral,
             )
             return
 
@@ -205,7 +211,7 @@ class VnOfMonthCog(commands.Cog):
                 assume_session_hours=assume_session_hours,
             )
         except ValueError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            await interaction.followup.send(f"❌ {exc}", ephemeral=ephemeral)
             return
 
         logger.info(
@@ -219,7 +225,7 @@ class VnOfMonthCog(commands.Cog):
         embed = self._build_embed(estimate, vn_data, stats)
         await interaction.followup.send(
             embed=embed,
-            ephemeral=True,
+            ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

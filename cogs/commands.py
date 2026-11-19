@@ -874,11 +874,12 @@ class CommandsCog(commands.Cog):
         vn_commands_info = {
             "vn_window": {
                 "category": "⚙️ Admin Commands",
-                "usage": "/vn_window vndb_id:<id or url> [lookback_days:<7-365>] [slack:<0-1>] [max_days:<7-365>] [assume_chars_per_hour:<int>] [assume_session_hours:<float>]",
+                "usage": "/vn_window vndb_id:<id or url> [public:<bool>] [lookback_days:<7-365>] [slack:<0-1>] [max_days:<7-365>] [assume_chars_per_hour:<int>] [assume_session_hours:<float>]",
                 "description": "Preview how long a VN would take this server to read",
-                "details": "Estimates a VN-of-the-Month reading window from VNDB's average playtime, jiten's character count and difficulty, and the server's measured reading pace (moji/hour and session length from immersion logs). Slack adds headroom (0.25 = 25%); max_days flags VNs that would not fit a cycle. Read-only preview: nothing is scheduled or saved, and every intermediate value is shown so the numbers can be sanity-checked before the vote/cycle machinery is switched on.",
+                "details": "Estimates a VN-of-the-Month reading window from VNDB's average playtime, jiten's character count and difficulty, and the server's measured reading pace (moji/hour and session length from immersion logs). The result is private (only you can see it) unless you pass public:true. Slack adds headroom (0.25 = 25%); max_days flags VNs that would not fit a cycle. Read-only preview: nothing is scheduled or saved, and every intermediate value is shown so the numbers can be sanity-checked before the vote/cycle machinery is switched on.",
                 "examples": [
                     "/vn_window vndb_id:v38511",
+                    "/vn_window vndb_id:v17 public:true",
                     "/vn_window vndb_id:v17 slack:0.35 max_days:56",
                     "/vn_window vndb_id:https://vndb.org/v24 lookback_days:180",
                     "/vn_window vndb_id:v17 assume_chars_per_hour:14000"
