@@ -800,6 +800,105 @@ class ActivityRepository:
             logger.error(f"Error aggregating daily activity summary: {e}")
             return summary
 
+    async def get_reading_speed_stats(self, lookback_days: int = 90) -> Dict[str, Any]:
+        """Measure how fast this server actually reads visual novels.
+
+        Feeds the VN-of-the-Month reading-window estimate: characters per hour
+        turns a VN's length into reading hours, and the session length turns
+        those hours into calendar days.
+
+        Per member, only VN logs count, with implausible rows discarded (< 5 min
+        or < 1 000 characters) and implausible paces filtered (2 000–60 000
+        moji/h). Members need at least 2 hours logged to contribute.
+
+        Returns a dict with:
+            users, hours, characters, chars_per_hour, session_hours,
+            lookback_days, usable
+        where the medians are hours-weighted (robust against a single
+        speed-reader) and ``usable`` is False for thin samples.
+        """
+        import aiosqlite
+
+        from utils.vn_duration import weighted_median
+
+        try:
+            days = max(1, int(lookback_days))
+        except (TypeError, ValueError):
+            days = 90
+        offset = f"-{days} days"
+
+        empty = {
+            'users': 0,
+            'hours': 0.0,
+            'characters': 0,
+            'chars_per_hour': None,
+            'session_hours': None,
+            'lookback_days': days,
+            'usable': False,
+        }
+
+        try:
+            async with aiosqlite.connect(self.db.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """
+                    WITH per_log AS (
+                        SELECT user_id,
+                               CAST(json_extract(meta, '$.characters') AS REAL) AS chars,
+                               duration AS seconds,
+                               substr(datetime(date), 1, 10) AS day
+                        FROM immersion_activities
+                        WHERE deleted_at IS NULL
+                          AND media_type = 'visual_novel'
+                          AND datetime(date) >= datetime('now', ?)
+                          AND user_id NOT IN (SELECT user_id FROM user_blacklist)
+                          AND duration >= 300
+                          AND json_extract(meta, '$.characters') IS NOT NULL
+                          AND CAST(json_extract(meta, '$.characters') AS INTEGER) >= 1000
+                    ),
+                    per_user AS (
+                        SELECT user_id,
+                               SUM(chars) AS chars,
+                               SUM(seconds) / 3600.0 AS hours,
+                               COUNT(DISTINCT day) AS active_days
+                        FROM per_log
+                        GROUP BY user_id
+                    )
+                    SELECT user_id, chars, hours, active_days,
+                           chars / hours AS chars_per_hour,
+                           hours / active_days AS session_hours
+                    FROM per_user
+                    WHERE hours >= 2
+                      AND chars / hours BETWEEN 2000 AND 60000
+                    """,
+                    (offset,),
+                ) as cursor:
+                    rows = [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error measuring server reading speed: {e}")
+            return empty
+
+        if not rows:
+            return empty
+
+        chars_per_hour = weighted_median(
+            [(row['chars_per_hour'], row['hours']) for row in rows]
+        )
+        session_hours = weighted_median(
+            [(row['session_hours'], row['active_days']) for row in rows]
+        )
+        total_hours = sum(row['hours'] for row in rows)
+
+        return {
+            'users': len(rows),
+            'hours': round(total_hours, 2),
+            'characters': int(sum(row['chars'] for row in rows)),
+            'chars_per_hour': round(chars_per_hour, 1) if chars_per_hour else None,
+            'session_hours': round(session_hours, 2) if session_hours else None,
+            'lookback_days': days,
+            'usable': len(rows) >= 5 and total_hours >= 20,
+        }
+
     async def get_vn_durations_by_user(
         self,
         guild_id: Optional[str] = None,

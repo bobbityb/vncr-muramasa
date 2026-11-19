@@ -101,7 +101,7 @@ start_web_console_thread()
 
 # Load cogs
 async def load_extensions():
-    for cog in ['cogs.commands', 'cogs.events', 'cogs.vn_month', 'cogs.backup', 'cogs.server_backup', 'cogs.error_logging', 'cogs.verification', 'cogs.onboarding', 'cogs.immersion', 'cogs.highlights', 'cogs.sticky_messages', 'cogs.kizuna', 'cogs.daily_log_summary', 'cogs.message_purge', 'cogs.role_menu', 'cogs.message_filter', 'cogs.media_flag']:
+    for cog in ['cogs.commands', 'cogs.events', 'cogs.vn_month', 'cogs.vn_of_month', 'cogs.backup', 'cogs.server_backup', 'cogs.error_logging', 'cogs.verification', 'cogs.onboarding', 'cogs.immersion', 'cogs.highlights', 'cogs.sticky_messages', 'cogs.kizuna', 'cogs.daily_log_summary', 'cogs.message_purge', 'cogs.role_menu', 'cogs.message_filter', 'cogs.media_flag']:
         try:
             await bot.load_extension(cog)
             logger.info(f'Loaded cog: {cog}')
