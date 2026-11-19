@@ -768,18 +768,19 @@ class ImmersionCog(commands.Cog):
                 })
 
                 if image_url:
-                    context["cover_url"] = image_url  # Always set the URL
+                    context["cover_url"] = image_url  # VNDB cover: the real artwork
                     context["cover_is_nsfw"] = cover_is_explicit
 
-                # Prefer the jiten.moe cover whenever the VN is on jiten: it is
-                # cropped and always SFW, so it sidesteps the NSFW gate entirely
-                # (VNs not on jiten keep the VNDB cover and its explicit-cover check).
+                # jiten is used for the deck id and only as a cover *fallback*.
+                # For decks it has no artwork for, jiten serves an auto-generated
+                # placeholder (a gradient with the title), so it must never
+                # override the VNDB cover.
                 try:
                     async with JitenClient() as jiten:
                         jinfo = await jiten.get_by_vndb_id(vn_id)
                     if jinfo:
                         context["jiten_deck_id"] = jinfo.deck_id
-                        if jinfo.cover_url:
+                        if jinfo.cover_url and not context["cover_url"]:
                             context["cover_url"] = jinfo.cover_url
                             context["cover_is_nsfw"] = False
                 except Exception as e:
