@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # SETTINGS - edit IDs, limits and messages here.
 # ---------------------------------------------------------------------------
-MAL_LOG_CHANNEL_ID = 1444163978749280276   # MAL -> Discord logs and cap notices go here
+MAL_LOG_CHANNEL_ID = 1415741464545329272   # MAL -> Discord logs and cap notices go here
 DAILY_CAP_HOURS = 5                       # max anime time per member per day (UTC) from MAL
 POLL_MINUTES = 10                         # how often linked lists are checked
 FALLBACK_EPISODE_MINUTES = 24             # when MAL doesn't know an episode's length
@@ -120,6 +120,10 @@ class MalCog(commands.Cog):
         return os.getenv("MAL_REDIRECT_URI", "").strip()
 
     async def cog_load(self):
+        await self.init_db()
+        self.poll.start()
+
+    async def init_db(self):
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS mal_links (
@@ -151,7 +155,6 @@ class MalCog(commands.Cog):
                 );
             """)
             await db.commit()
-        self.poll.start()
 
     async def cog_unload(self):
         self.poll.cancel()
@@ -319,19 +322,7 @@ class MalCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        verifier = secrets.token_urlsafe(96)[:128]   # PKCE code verifier (43-128 chars)
-        state = secrets.token_urlsafe(16)
-        self.pending[str(interaction.user.id)] = (verifier, state, now_utc())
-        params = {
-            "response_type": "code",
-            "client_id": self.client_id,
-            "state": state,
-            "code_challenge": verifier,          # MAL only supports the "plain" method
-            "code_challenge_method": "plain",
-        }
-        if self.redirect_uri:
-            params["redirect_uri"] = self.redirect_uri
-        auth_url = f"{AUTH_URL}?{urlencode(params)}"
+        auth_url = self.start_link(str(interaction.user.id))
         text = (
             "Link your MyAnimeList account\n"
             "1. Press Open MyAnimeList, log in if asked, and press Allow.\n"
@@ -344,48 +335,56 @@ class MalCog(commands.Cog):
         )
         await interaction.response.send_message(text, view=LinkView(self, auth_url), ephemeral=True)
 
-    async def finish_link(self, interaction: discord.Interaction, pasted: str):
-        user_id = str(interaction.user.id)
+    def start_link(self, user_id: str) -> str:
+        """Begin linking: remember a fresh PKCE verifier for this member and return MAL's
+        login address. (Also used by the standalone mal-test.py check.)"""
+        verifier = secrets.token_urlsafe(96)[:128]   # PKCE code verifier (43-128 chars)
+        state = secrets.token_urlsafe(16)
+        self.pending[user_id] = (verifier, state, now_utc())
+        params = {
+            "response_type": "code",
+            "client_id": self.client_id,
+            "state": state,
+            "code_challenge": verifier,          # MAL only supports the "plain" method
+            "code_challenge_method": "plain",
+        }
+        if self.redirect_uri:
+            params["redirect_uri"] = self.redirect_uri
+        return f"{AUTH_URL}?{urlencode(params)}"
+
+    async def complete_link(self, user_id: str, pasted: str) -> Tuple[bool, str]:
+        """Finish linking from the address the member pasted. Returns (linked?, message for
+        the member). Only the member sees the message; it names their MAL account."""
         pending = self.pending.get(user_id)
         if not pending or now_utc() - pending[2] > timedelta(minutes=LINK_TIMEOUT_MINUTES):
-            await interaction.response.send_message("That link expired. Please start again with `/mal link`.", ephemeral=True)
-            return
+            return False, "That link expired. Please start again with `/mal link`."
         verifier, state, _ = pending
         pasted = pasted.strip()
         query = parse_qs(urlparse(pasted).query) if "code=" in pasted else {}
         code = (query.get("code") or [pasted if "=" not in pasted else ""])[0]
         if not code or (query.get("state") and query["state"][0] != state):
-            await interaction.response.send_message(
-                "That doesn't look like the right address. Please start again with `/mal link`.", ephemeral=True
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
+            return False, "That doesn't look like the right address. Please start again with `/mal link`."
 
         fields = {"grant_type": "authorization_code", "code": code, "code_verifier": verifier}
         if self.redirect_uri:
             fields["redirect_uri"] = self.redirect_uri
         tokens = await self._token_request(fields)
         if tokens is None:
-            await interaction.followup.send("MyAnimeList didn't accept that. Please start again with `/mal link`.", ephemeral=True)
-            return
+            return False, "MyAnimeList didn't accept that. Please start again with `/mal link`."
         self.pending.pop(user_id, None)
 
         link = {"user_id": user_id, "access_token": tokens["access_token"], "refresh_token": tokens.get("refresh_token"),
                 "expires_at": (now_utc() + timedelta(seconds=int(tokens.get("expires_in") or 3600))).isoformat()}
         status, me = await self._api(link, "GET", "/users/@me")
         if status != 200 or "id" not in me:
-            await interaction.followup.send("Couldn't read your MyAnimeList account. Please try again later.", ephemeral=True)
-            return
+            return False, "Couldn't read your MyAnimeList account. Please try again later."
 
         async with self.lock:
             async with aiosqlite.connect(self.db_path) as db:
                 async with db.execute("SELECT user_id FROM mal_links WHERE mal_user_id = ?", (me["id"],)) as cur:
                     row = await cur.fetchone()
                 if row and row[0] != user_id:
-                    await interaction.followup.send(
-                        "That MyAnimeList account is already linked to another Discord account.", ephemeral=True
-                    )
-                    return
+                    return False, "That MyAnimeList account is already linked to another Discord account."
                 await db.execute("DELETE FROM mal_snapshot WHERE user_id = ?", (user_id,))
                 await db.execute(
                     "INSERT OR REPLACE INTO mal_links (user_id, mal_user_id, mal_name, access_token, refresh_token, "
@@ -400,12 +399,17 @@ class MalCog(commands.Cog):
             for entry in entries:
                 await self.set_snapshot(user_id, entry["node"]["id"], int(entry["list_status"].get("num_episodes_watched") or 0))
 
-        await interaction.followup.send(
+        logger.info(f"[MAL] Discord user {user_id} linked MAL account {me.get('name')} ({me['id']})")
+        return True, (
             f"✅ Linked to MyAnimeList account {me.get('name')}. Your existing list ({len(entries)} anime) "
-            "isn't logged; only episodes you mark as watched from now on.",
-            ephemeral=True,
+            "isn't logged; only episodes you mark as watched from now on."
         )
-        logger.info(f"[MAL] {interaction.user} ({user_id}) linked MAL account {me.get('name')} ({me['id']})")
+
+    async def finish_link(self, interaction: discord.Interaction, pasted: str):
+        """Discord side of linking: everything here is only shown to the member."""
+        await interaction.response.defer(ephemeral=True)
+        _, message = await self.complete_link(str(interaction.user.id), pasted)
+        await interaction.followup.send(message, ephemeral=True)
 
     @mal.command(name="unlink", description="Unlink your MyAnimeList account")
     async def mal_unlink(self, interaction: discord.Interaction):
