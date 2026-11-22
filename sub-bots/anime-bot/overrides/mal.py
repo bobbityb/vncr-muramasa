@@ -82,7 +82,11 @@ class LinkView(discord.ui.View):
     def __init__(self, cog: "MalCog", auth_url: str):
         super().__init__(timeout=LINK_TIMEOUT_MINUTES * 60)
         self.cog = cog
+        # Show "1. Open MyAnimeList" before "2. Paste the address" (the paste button is
+        # added by its decorator first, so move it after the link)
+        self.remove_item(self.paste)
         self.add_item(discord.ui.Button(label="1. Open MyAnimeList", style=discord.ButtonStyle.link, url=auth_url))
+        self.add_item(self.paste)
 
     @discord.ui.button(label="2. Paste the address", style=discord.ButtonStyle.primary)
     async def paste(self, interaction: discord.Interaction, button: discord.ui.Button):
