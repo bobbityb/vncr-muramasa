@@ -775,18 +775,19 @@ class ImmersionCog(commands.Cog):
                 })
 
                 if image_url:
-                    context["cover_url"] = image_url  # Always set the URL
+                    context["cover_url"] = image_url  # VNDB cover: the real artwork
                     context["cover_is_nsfw"] = cover_is_explicit
 
-                # Prefer the jiten.moe cover whenever the VN is on jiten: it is
-                # cropped and always SFW, so it sidesteps the NSFW gate entirely
-                # (VNs not on jiten keep the VNDB cover and its explicit-cover check).
+                # jiten is used for the deck id and only as a cover *fallback*.
+                # For decks it has no artwork for, jiten serves an auto-generated
+                # placeholder (a gradient with the title), so it must never
+                # override the VNDB cover.
                 try:
                     async with JitenClient() as jiten:
                         jinfo = await jiten.get_by_vndb_id(vn_id)
                     if jinfo:
                         context["jiten_deck_id"] = jinfo.deck_id
-                        if jinfo.cover_url:
+                        if jinfo.cover_url and not context["cover_url"]:
                             context["cover_url"] = jinfo.cover_url
                             context["cover_is_nsfw"] = False
                 except Exception as e:
@@ -945,7 +946,7 @@ class ImmersionCog(commands.Cog):
                     "cover_is_nsfw": cover_is_nsfw,
                 })
 
-                if cover_url and not cover_is_nsfw:
+                if cover_url:
                     context["cover_url"] = cover_url
 
                 context["meta"]["anilist"] = {
@@ -1483,13 +1484,8 @@ class ImmersionCog(commands.Cog):
                 inline=True,
             )
 
-        if vn_context.get("cover_is_nsfw"):
-            embed.add_field(
-                name="Cover",
-                value="🔞 Cover hidden (marked explicit on VNDB)",
-                inline=False,
-            )
-        elif vn_context.get("cover_url"):
+        # Covers are always shown: hiding them left log entries without artwork.
+        if vn_context.get("cover_url"):
             embed.set_thumbnail(url=vn_context["cover_url"])
 
         title_stats = await self.activity_repo.get_title_stats(
@@ -3021,13 +3017,11 @@ class ImmersionCog(commands.Cog):
                     if api_fields:
                         embed.add_field(name="📚 VNDB Info", value="\n".join(api_fields), inline=False)
                     
-                    # Add cover image if available and not NSFW
-                    if api_metadata.get("cover_url") and not api_metadata.get("cover_is_nsfw"):
+                    # Add cover image if available (never censored)
+                    if api_metadata.get("cover_url"):
                         embed.set_thumbnail(url=api_metadata["cover_url"])
-                    elif api_metadata.get("cover_is_nsfw"):
-                        embed.add_field(name="🔞 Cover", value="Cover hidden (marked explicit on VNDB)", inline=False)
                     # Metadata present but no cover URL
-                    elif api_metadata.get("id") and not api_metadata.get("cover_url"):
+                    elif api_metadata.get("id"):
                         logger.debug(f"VN {api_metadata['id']} has metadata but no cover URL")
                 
                 elif api_metadata["type"] == "anime":
@@ -3894,11 +3888,9 @@ class ImmersionCog(commands.Cog):
                     color=discord.Color.purple()
                 )
 
-                # Add cover as thumbnail if available and not NSFW
-                if item.get('cover_url') and not item.get('cover_is_nsfw'):
+                # Add cover as thumbnail if available (never censored)
+                if item.get('cover_url'):
                     item_embed.set_thumbnail(url=item['cover_url'])
-                elif item.get('cover_url') and item.get('cover_is_nsfw'):
-                    item_embed.add_field(name="🔞 NSFW Cover", value="Cover hidden", inline=False)
 
                 # Add stats
                 item_embed.add_field(name="⏱️ Total Time", value=f"**{duration_str}**", inline=True)
@@ -8304,11 +8296,9 @@ class LibraryNavigationView(discord.ui.View):
                         color=discord.Color.purple()
                     )
 
-                    # Add cover as thumbnail if available and not NSFW
-                    if item.get('cover_url') and not item.get('cover_is_nsfw'):
+                    # Add cover as thumbnail if available (never censored)
+                    if item.get('cover_url'):
                         item_embed.set_thumbnail(url=item['cover_url'])
-                    elif item.get('cover_url') and item.get('cover_is_nsfw'):
-                        item_embed.add_field(name="🔞 NSFW Cover", value="Cover hidden", inline=False)
 
                     # Add stats
                     item_embed.add_field(name="⏱️ Total Time", value=f"**{duration_str}**", inline=True)

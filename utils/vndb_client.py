@@ -70,7 +70,8 @@ class VNDBClient:
             data = {
                 "filters": ["id", "=", vn_id],
                 "fields": (
-                    "id,title,description,length,rating,votecount,released,"
+                    "id,title,description,length,length_minutes,length_votes,"
+                    "rating,votecount,released,"
                     "image.url,image.sexual,"
                     "tags.name,tags.rating,tags.spoiler,tags.category,"
                     "titles.title,titles.lang,titles.latin"

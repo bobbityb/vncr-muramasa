@@ -872,6 +872,20 @@ class CommandsCog(commands.Cog):
         }
 
         vn_commands_info = {
+            "vn_window": {
+                "category": "⚙️ Admin Commands",
+                "usage": "/vn_window vndb_id:<id or url> [public:<bool>] [lookback_days:<7-365>] [slack:<0-1>] [max_days:<7-365>] [assume_chars_per_hour:<int>] [assume_session_hours:<float>]",
+                "description": "Preview how long a VN would take this server to read",
+                "details": "Estimates a VN-of-the-Month reading window from VNDB's average playtime, jiten's character count and difficulty, and the server's measured reading pace (moji/hour and session length from immersion logs). The result is private (only you can see it) unless you pass public:true. Slack adds headroom (0.25 = 25%); max_days flags VNs that would not fit a cycle. Read-only preview: nothing is scheduled or saved, and every intermediate value is shown so the numbers can be sanity-checked before the vote/cycle machinery is switched on.",
+                "examples": [
+                    "/vn_window vndb_id:v38511",
+                    "/vn_window vndb_id:v17 public:true",
+                    "/vn_window vndb_id:v17 slack:0.35 max_days:56",
+                    "/vn_window vndb_id:https://vndb.org/v24 lookback_days:180",
+                    "/vn_window vndb_id:v17 assume_chars_per_hour:14000"
+                ],
+                "admin_only": True
+            },
             "manage_welcome": {
                 "category": "⚙️ Admin Commands",
                 "usage": "/manage_welcome action:<set_channel|test> [channel:<#channel>]",
@@ -984,6 +998,32 @@ class CommandsCog(commands.Cog):
                 "examples": [
                     "/manage_highlights action:setup",
                     "/manage_highlights action:status"
+                ],
+                "admin_only": True
+            },
+            "manage_daily_summary": {
+                "category": "⚙️ Admin Commands",
+                "usage": "/manage_daily_summary action:<setup|set_channel|reset_style|status|run|test> [channel:<#channel>] [date:<YYYY-MM-DD>] [title:<template>] [description:<template>] [footer:<template>] [color:<#RRGGBB>] [show_titles:<bool>] [show_leaderboard:<bool>] [show_characters:<bool>]",
+                "description": "Configure, post or preview the daily immersion summary",
+                "details": "setup sets the channel and any style options in one go; set_channel changes (or, with no channel, clears) where the summary is posted; reset_style restores the default look; status shows the current settings; run posts a day's summary now; test shows a private preview only you can see (nothing is posted). show_characters adds a 'Characters read' line next to the reading time. Templates support {month}, {day}, {year}, {date}, {total}, {logs}, {users}, {reading}, {listening}, {characters}, {kizuna_logs}, {manual_logs} and server emoji.",
+                "examples": [
+                    "/manage_daily_summary action:setup channel:#immersion title:📊 {month} recap color:#5865F2",
+                    "/manage_daily_summary action:setup show_characters:true",
+                    "/manage_daily_summary action:test",
+                    "/manage_daily_summary action:run date:2026-11-18"
+                ],
+                "admin_only": True
+            },
+            "manage_daily_congrats": {
+                "category": "⚙️ Admin Commands",
+                "usage": "/manage_daily_congrats action:<set_channel|set_message|status|run|test> [channel:<#channel>] [message:<template>] [show_characters:<bool>] [date:<YYYY-MM-DD>]",
+                "description": "Configure, send or preview the #1 congratulation ping",
+                "details": "set_channel sets where the ping goes (omit the channel to fall back to the summary channel); set_message sets the text (omit it to reset to the default; placeholders {users}, {duration}, {date}, {characters}, server emoji allowed); show_characters adds the winner's characters read to the message (automatically appended unless your template uses {characters}); status shows the current setup; run sends the ping for a day now; test shows a private preview with no actual ping.",
+                "examples": [
+                    "/manage_daily_congrats action:set_channel channel:#general",
+                    "/manage_daily_congrats action:set_message message:🎉 Congrats {users}! Top spot on {date} with {duration} ({characters} chars) <:poggers:123456789>",
+                    "/manage_daily_congrats action:set_message show_characters:true",
+                    "/manage_daily_congrats action:test"
                 ],
                 "admin_only": True
             },
