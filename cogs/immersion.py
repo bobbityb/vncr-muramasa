@@ -2188,6 +2188,234 @@ class ImmersionCog(commands.Cog):
             logger.error(f"Error in log_book command: {e}")
             await safe_followup(interaction, "An error occurred while logging the book.", ephemeral=True)
 
+    async def _log_anime_core(
+        self,
+        user_id: str,
+        guild_id: Optional[str],
+        name: str,
+        episodes: int,
+        episode_duration: int = 24,
+        activity_date: Optional[datetime] = None,
+        comment: Optional[str] = None,
+        *,
+        extra_meta: Optional[Dict[str, Any]] = None,
+        use_official_duration: bool = True,
+        source: str = "command",
+        fallback_name: Optional[str] = None,
+    ) -> Tuple[Optional[int], Optional[discord.Embed], Optional["UndoLogView"], List[Goal], Optional[discord.File], Optional[str]]:
+        """Core anime-log routine shared by /log_anime and the anime bot's MyAnimeList import.
+
+        Looks the title up on AniList, checks the 24h-per-day limit, saves the log and builds
+        the "Anime Activity Logged!" embed plus its Undo view, so every anime log looks the same.
+        Returns (activity_id, embed, view, completed_goals, progress_file, error); on failure
+        only `error` is set. After saving, dispatches "anime_activity_logged" (activity, source).
+        `use_official_duration=False` keeps episode_duration as given instead of AniList's.
+        `fallback_name` is used as the title when AniList can't resolve `name`.
+        """
+        activity_date = activity_date or datetime.now(timezone.utc)
+        anime_context = await self._build_anilist_context(MediaType.ANIME.value, name)
+        display_name = anime_context.get("display_name") or name
+        if fallback_name and anime_context.get("anilist_id") is None:
+            display_name = fallback_name
+
+        # Determine per-episode duration using AniList data when available
+        official_duration = anime_context.get("episode_duration")
+        per_episode_duration = episode_duration
+        if per_episode_duration <= 0:
+            per_episode_duration = official_duration or 24
+        elif use_official_duration and official_duration and episode_duration == 24:
+            per_episode_duration = official_duration
+
+        per_episode_duration = per_episode_duration or 0
+        per_episode_duration = int(per_episode_duration)
+
+        # Calculate total duration
+        duration_seconds = int(max(episodes, 0) * max(per_episode_duration, 0) * 60)
+
+        # Validate daily duration limit
+        if duration_seconds > 0:
+            duration_error = await self._validate_daily_duration_limit(user_id, activity_date, duration_seconds)
+            if duration_error:
+                return None, None, None, [], None, duration_error
+
+        # Create activity
+        activity = Activity(
+            user_id=user_id,
+            guild_id=guild_id,
+            name=display_name,
+            primary_type=ActivityType.LISTENING.value,
+            media_type=MediaType.ANIME.value,
+            duration=duration_seconds,
+            date=activity_date,
+            comment=comment
+        )
+
+        activity.set_meta('episodes', episodes)
+        activity.set_meta('episode_duration', per_episode_duration)
+        if official_duration:
+            activity.set_meta('anilist_episode_duration', official_duration)
+
+        if anime_context.get("meta", {}).get("anilist"):
+            activity.set_meta('anilist', anime_context["meta"]["anilist"])
+        if anime_context.get("anilist_id") is not None:
+            activity.set_meta('anilist_id', anime_context.get("anilist_id"))
+        if anime_context.get("total_episodes") is not None:
+            activity.set_meta('anilist_total_episodes', anime_context.get("total_episodes"))
+        for key, value in (extra_meta or {}).items():
+            activity.set_meta(key, value)
+
+        # Save to database
+        try:
+            activity_id = await self.activity_repo.create_activity(activity)
+        except ValueError as e:
+            return None, None, None, [], None, f"❌ {e}"
+        if not activity_id:
+            return None, None, None, [], None, "Failed to log anime activity."
+
+        # Lets sub-bots react to new anime logs (the anime bot syncs them to MyAnimeList)
+        try:
+            self.bot.dispatch("anime_activity_logged", activity, source)
+        except Exception as exc:
+            logger.warning(f"anime_activity_logged dispatch failed: {exc}")
+
+        # Check for completed goals
+        completed_goals = await self.goal_service.check_completed(activity)
+
+        # Create response embed
+        embed = discord.Embed(
+            title="Anime Activity Logged!",
+            color=discord.Color.green(),
+            timestamp=activity_date
+        )
+        
+        embed.add_field(name="Title", value=display_name, inline=False)
+        embed.add_field(name="Episodes", value=str(episodes), inline=True)
+        embed.add_field(name="Duration", value=_format_duration_value(activity.duration), inline=True)
+
+        if anime_context.get("cover_url"):
+            embed.set_thumbnail(url=anime_context["cover_url"])
+
+        # Add title totals
+        title_stats = await self.activity_repo.get_title_stats(
+            user_id,
+            display_name,
+            media_type="anime"
+        )
+        if title_stats:
+            totals_parts = [f"**{_format_duration_value(title_stats['total_duration'])}** total"]
+            if title_stats.get('total_episodes', 0) > 0:
+                totals_parts.append(f"**{title_stats['total_episodes']}** eps")
+            totals_parts.append(f"**{title_stats['total_count']}** logs")
+            embed.add_field(
+                name="📚 Title Totals",
+                value=" • ".join(totals_parts),
+                inline=False
+            )
+
+        # Add anime class progress information (only if duration was logged)
+        progress_file: Optional[discord.File] = None
+        if duration_seconds > 0:
+            # Get updated anime duration after the activity was saved
+            anime_seconds = await self.activity_repo.sum_activity_duration(user_id, media_type=MediaType.ANIME.value)
+            anime_hours = (anime_seconds or 0) / 3600
+            
+            # Use anime class definitions (not VN class definitions)
+            anime_class_definitions = ANIME_CLASS_ROLE_DEFINITIONS
+            
+            current_class = None
+            next_class = None
+            
+            if anime_class_definitions:
+                current_class = anime_class_definitions[0]["name"]
+                for definition in anime_class_definitions:
+                    if anime_hours >= definition["min_hours"]:
+                        current_class = definition["name"]
+                    else:
+                        next_class = definition
+                        break
+            
+            if current_class and next_class:
+                next_threshold = next_class["min_hours"]
+                hours_to_next = next_threshold - anime_hours
+                
+                # Find current class threshold for tier-relative progress
+                current_threshold = 0
+                for definition in anime_class_definitions:
+                    if definition["name"] == current_class:
+                        current_threshold = definition["min_hours"]
+                        break
+                if current_threshold < 0.001:
+                    current_threshold = 0.0  # epsilon "first log" thresholds display as 0h
+
+                # Calculate tier-relative progress (progress within current tier)
+                progress_in_tier = anime_hours - current_threshold
+                tier_width = next_threshold - current_threshold
+                progress_ratio = min(progress_in_tier / tier_width, 1.0) if tier_width > 0 else 1.0
+                progress_pct = progress_ratio * 100
+
+                # Portion of the tier earned by this log (clamped to the tier).
+                before_in_tier = max(anime_hours - duration_seconds / 3600 - current_threshold, 0.0)
+                before_ratio = min(before_in_tier / tier_width, 1.0) if tier_width > 0 else 1.0
+                gained_ratio = max(progress_ratio - before_ratio, 0.0)
+
+                # Color bar image (green = prior progress, yellow = this log);
+                # text bar only if the render fails.
+                bar_line = ""
+                try:
+                    png = await asyncio.to_thread(render_class_progress_bar, progress_ratio, gained_ratio)
+                    progress_file = discord.File(io.BytesIO(png), filename="class_progress.png")
+                    embed.set_image(url="attachment://class_progress.png")
+                except Exception as exc:
+                    logger.warning(f"Class progress bar render failed: {exc}")
+                    bar_line = f"{_render_log_progress_bar(progress_ratio)}\n"
+
+                if anime_hours == 0 and current_class == "人間":
+                    progress_value = (
+                        f"**{current_class} ({current_threshold:.0f}h)** → **{next_class['name']} ({next_threshold:.0f}h)**\n"
+                        f"{bar_line}"
+                        f"Log your first session to advance!\n"
+                        f"**Total Anime Time:** {_format_hours_display(anime_hours)}"
+                    )
+                else:
+                    # Show tier progress explicitly
+                    progress_value = (
+                        f"**{current_class} ({current_threshold:.0f}h)** → **{next_class['name']} ({next_threshold:.0f}h)**\n"
+                        f"{bar_line}"
+                        f"{progress_pct:.1f}% (+{_format_gained_pct(gained_ratio)}%) • "
+                        f"{_format_hours_display(progress_in_tier)} / {_format_hours_display(tier_width)} in tier • {_format_hours_display(hours_to_next)} to go\n"
+                        f"**Total Anime Time:** {_format_hours_display(anime_hours)}"
+                    )
+                
+                embed.add_field(name="⚔️ Anime Class Progress", value=progress_value, inline=False)
+            elif current_class:
+                # Max tier reached
+                current_threshold = 0
+                for definition in anime_class_definitions:
+                    if definition["name"] == current_class:
+                        current_threshold = definition["min_hours"]
+                        break
+                progress_value = f"**{current_class} ({current_threshold:.0f}h)** ✨ MAX TIER\n**Total Anime Time:** {_format_hours_display(anime_hours)}"
+                embed.add_field(name="⚔️ Anime Class Progress", value=progress_value, inline=False)
+        
+        # Add comment if provided
+        if comment:
+            embed.add_field(name="💭 Comment", value=comment, inline=False)
+        
+        embed.set_footer(text=f"Activity ID: {activity_id}")
+
+        # Create view with undo button
+        view = UndoLogView(activity_id, int(user_id), self)
+        
+        # Add AniList link if available
+        if anime_context.get("anilist_url"):
+            view.add_item(discord.ui.Button(
+                label="Open on AniList",
+                style=discord.ButtonStyle.link,
+                url=anime_context["anilist_url"],
+            ))
+
+        return activity_id, embed, view, completed_goals, progress_file, None
+
     @app_commands.command(name="log_anime", description="Log anime watching")
     @app_commands.describe(
         name="Name of the anime",
@@ -2204,7 +2432,7 @@ class ImmersionCog(commands.Cog):
             return  # Interaction expired; nothing to respond to
 
         try:
-            
+
             # Validate comment length (Discord embed field limit is 1024 characters)
             if comment and len(comment) > 1024:
                 await interaction.followup.send(
@@ -2214,27 +2442,10 @@ class ImmersionCog(commands.Cog):
                     ephemeral=True
                 )
                 return
-            
+
             user_id = str(interaction.user.id)
             guild_id = str(interaction.guild_id) if interaction.guild_id else None
 
-            anime_context = await self._build_anilist_context(MediaType.ANIME.value, name)
-            display_name = anime_context.get("display_name") or name
-            
-            # Determine per-episode duration using AniList data when available
-            official_duration = anime_context.get("episode_duration")
-            per_episode_duration = episode_duration
-            if per_episode_duration <= 0:
-                per_episode_duration = official_duration or 24
-            elif official_duration and episode_duration == 24:
-                per_episode_duration = official_duration
-
-            per_episode_duration = per_episode_duration or 0
-            per_episode_duration = int(per_episode_duration)
-
-            # Calculate total duration
-            duration_seconds = int(max(episodes, 0) * max(per_episode_duration, 0) * 60)
-            
             # Parse date if provided
             activity_date = datetime.now(timezone.utc)
             if date:
@@ -2243,190 +2454,20 @@ class ImmersionCog(commands.Cog):
                 except ValueError as e:
                     await interaction.followup.send(f"Invalid date format: {str(e)}", ephemeral=True)
                     return
-            
+
             # Validate date restrictions
             user_tz = await self.time_service.get_time_location(user_id, guild_id)
             date_error = await self._validate_log_date(activity_date, user_tz)
             if date_error:
                 await interaction.followup.send(date_error, ephemeral=True)
                 return
-            
-            # Validate daily duration limit
-            if duration_seconds > 0:
-                duration_error = await self._validate_daily_duration_limit(user_id, activity_date, duration_seconds)
-                if duration_error:
-                    await interaction.followup.send(duration_error, ephemeral=True)
-                    return
-            
-            # Create activity
-            activity = Activity(
-                user_id=user_id,
-                guild_id=guild_id,
-                name=display_name,
-                primary_type=ActivityType.LISTENING.value,
-                media_type=MediaType.ANIME.value,
-                duration=duration_seconds,
-                date=activity_date,
-                comment=comment
-            )
-            
-            activity.set_meta('episodes', episodes)
-            activity.set_meta('episode_duration', per_episode_duration)
-            if official_duration:
-                activity.set_meta('anilist_episode_duration', official_duration)
 
-            if anime_context.get("meta", {}).get("anilist"):
-                activity.set_meta('anilist', anime_context["meta"]["anilist"])
-            if anime_context.get("anilist_id") is not None:
-                activity.set_meta('anilist_id', anime_context.get("anilist_id"))
-            if anime_context.get("total_episodes") is not None:
-                activity.set_meta('anilist_total_episodes', anime_context.get("total_episodes"))
-            
-            # Save to database
-            try:
-                activity_id = await self.activity_repo.create_activity(activity)
-            except ValueError as e:
-                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            activity_id, embed, view, completed_goals, progress_file, error = await self._log_anime_core(
+                user_id, guild_id, name, episodes, episode_duration, activity_date, comment,
+            )
+            if error:
+                await interaction.followup.send(error, ephemeral=True)
                 return
-            if not activity_id:
-                await interaction.followup.send("Failed to log anime activity.", ephemeral=True)
-                return
-            
-            # Check for completed goals
-            completed_goals = await self.goal_service.check_completed(activity)
-            
-            # Create response embed
-            embed = discord.Embed(
-                title="Anime Activity Logged!",
-                color=discord.Color.green(),
-                timestamp=activity_date
-            )
-            
-            embed.add_field(name="Title", value=display_name, inline=False)
-            embed.add_field(name="Episodes", value=str(episodes), inline=True)
-            embed.add_field(name="Duration", value=_format_duration_value(activity.duration), inline=True)
-
-            if anime_context.get("cover_url"):
-                embed.set_thumbnail(url=anime_context["cover_url"])
-
-            # Add title totals
-            title_stats = await self.activity_repo.get_title_stats(
-                user_id,
-                display_name,
-                media_type="anime"
-            )
-            if title_stats:
-                totals_parts = [f"**{_format_duration_value(title_stats['total_duration'])}** total"]
-                if title_stats.get('total_episodes', 0) > 0:
-                    totals_parts.append(f"**{title_stats['total_episodes']}** eps")
-                totals_parts.append(f"**{title_stats['total_count']}** logs")
-                embed.add_field(
-                    name="📚 Title Totals",
-                    value=" • ".join(totals_parts),
-                    inline=False
-                )
-
-            # Add anime class progress information (only if duration was logged)
-            progress_file: Optional[discord.File] = None
-            if duration_seconds > 0:
-                # Get updated anime duration after the activity was saved
-                anime_seconds = await self.activity_repo.sum_activity_duration(user_id, media_type=MediaType.ANIME.value)
-                anime_hours = (anime_seconds or 0) / 3600
-                
-                # Use anime class definitions (not VN class definitions)
-                anime_class_definitions = ANIME_CLASS_ROLE_DEFINITIONS
-                
-                current_class = None
-                next_class = None
-                
-                if anime_class_definitions:
-                    current_class = anime_class_definitions[0]["name"]
-                    for definition in anime_class_definitions:
-                        if anime_hours >= definition["min_hours"]:
-                            current_class = definition["name"]
-                        else:
-                            next_class = definition
-                            break
-                
-                if current_class and next_class:
-                    next_threshold = next_class["min_hours"]
-                    hours_to_next = next_threshold - anime_hours
-                    
-                    # Find current class threshold for tier-relative progress
-                    current_threshold = 0
-                    for definition in anime_class_definitions:
-                        if definition["name"] == current_class:
-                            current_threshold = definition["min_hours"]
-                            break
-                    if current_threshold < 0.001:
-                        current_threshold = 0.0  # epsilon "first log" thresholds display as 0h
-
-                    # Calculate tier-relative progress (progress within current tier)
-                    progress_in_tier = anime_hours - current_threshold
-                    tier_width = next_threshold - current_threshold
-                    progress_ratio = min(progress_in_tier / tier_width, 1.0) if tier_width > 0 else 1.0
-                    progress_pct = progress_ratio * 100
-
-                    # Portion of the tier earned by this log (clamped to the tier).
-                    before_in_tier = max(anime_hours - duration_seconds / 3600 - current_threshold, 0.0)
-                    before_ratio = min(before_in_tier / tier_width, 1.0) if tier_width > 0 else 1.0
-                    gained_ratio = max(progress_ratio - before_ratio, 0.0)
-
-                    # Color bar image (green = prior progress, yellow = this log);
-                    # text bar only if the render fails.
-                    bar_line = ""
-                    try:
-                        png = await asyncio.to_thread(render_class_progress_bar, progress_ratio, gained_ratio)
-                        progress_file = discord.File(io.BytesIO(png), filename="class_progress.png")
-                        embed.set_image(url="attachment://class_progress.png")
-                    except Exception as exc:
-                        logger.warning(f"Class progress bar render failed: {exc}")
-                        bar_line = f"{_render_log_progress_bar(progress_ratio)}\n"
-
-                    if anime_hours == 0 and current_class == "人間":
-                        progress_value = (
-                            f"**{current_class} ({current_threshold:.0f}h)** → **{next_class['name']} ({next_threshold:.0f}h)**\n"
-                            f"{bar_line}"
-                            f"Log your first session to advance!\n"
-                            f"**Total Anime Time:** {_format_hours_display(anime_hours)}"
-                        )
-                    else:
-                        # Show tier progress explicitly
-                        progress_value = (
-                            f"**{current_class} ({current_threshold:.0f}h)** → **{next_class['name']} ({next_threshold:.0f}h)**\n"
-                            f"{bar_line}"
-                            f"{progress_pct:.1f}% (+{_format_gained_pct(gained_ratio)}%) • "
-                            f"{_format_hours_display(progress_in_tier)} / {_format_hours_display(tier_width)} in tier • {_format_hours_display(hours_to_next)} to go\n"
-                            f"**Total Anime Time:** {_format_hours_display(anime_hours)}"
-                        )
-                    
-                    embed.add_field(name="⚔️ Anime Class Progress", value=progress_value, inline=False)
-                elif current_class:
-                    # Max tier reached
-                    current_threshold = 0
-                    for definition in anime_class_definitions:
-                        if definition["name"] == current_class:
-                            current_threshold = definition["min_hours"]
-                            break
-                    progress_value = f"**{current_class} ({current_threshold:.0f}h)** ✨ MAX TIER\n**Total Anime Time:** {_format_hours_display(anime_hours)}"
-                    embed.add_field(name="⚔️ Anime Class Progress", value=progress_value, inline=False)
-            
-            # Add comment if provided
-            if comment:
-                embed.add_field(name="💭 Comment", value=comment, inline=False)
-            
-            embed.set_footer(text=f"Activity ID: {activity_id}")
-
-            # Create view with undo button
-            view = UndoLogView(activity_id, interaction.user.id, self)
-            
-            # Add AniList link if available
-            if anime_context.get("anilist_url"):
-                view.add_item(discord.ui.Button(
-                    label="Open on AniList",
-                    style=discord.ButtonStyle.link,
-                    url=anime_context["anilist_url"],
-                ))
 
             if progress_file:
                 await interaction.followup.send(embed=embed, view=view, file=progress_file)

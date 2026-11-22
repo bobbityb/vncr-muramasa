@@ -151,6 +151,11 @@ class ImmersionCog(ParentImmersionCog):
             self, interaction, name, episodes, episode_duration, date, comment
         )
 
+    @log_anime.autocomplete("name")
+    async def log_anime_name_autocomplete(self, interaction: discord.Interaction, current: str):
+        """AniList title suggestions, same as the parent's /log_anime."""
+        return await super().log_anime_name_autocomplete(interaction, current)
+
     # ---------------- undoing logs: admins can undo anyone's ----------------
 
     @staticmethod
@@ -846,6 +851,7 @@ class ImmersionCog(ParentImmersionCog):
             "activity_undo": "after undoing a log.",
             "manual": "after a manual sync.",
             "admin_time": "after an admin changed your anime watch time.",
+            "mal_import": "after your MyAnimeList update.",
         }
         trigger_phrase = trigger_map.get(source, "after your recent activity.")
 
