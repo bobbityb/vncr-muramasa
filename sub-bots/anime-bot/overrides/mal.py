@@ -8,10 +8,14 @@ Members link their MyAnimeList account with /mal link. Then, in both directions:
   At most 5 hours a day come in this way. When a member reaches the cap they're pinged
   once, and further MAL updates that day are dropped (not logged or posted, ever).
 
-Setup (.env), after registering an app at https://myanimelist.net/apiconfig:
-  MAL_CLIENT_ID       the app's Client ID (required)
-  MAL_CLIENT_SECRET   the app's Client Secret, if it has one
-  MAL_REDIRECT_URI    the App Redirect URL registered for the app (e.g. http://localhost/)
+Setup: the MAL app's Client ID is built in (DEFAULT_CLIENT_ID below; it's public anyway).
+Its Client Secret is NOT in the code: an admin enters it once per server with
+/manage_mal action:Connect. The bot checks it with MAL, stores it in data/anime_mal.db,
+and turns MAL syncing on for that server only. Servers where nobody entered the correct
+secret can't use the MAL link. .env can still override: MAL_CLIENT_ID, MAL_CLIENT_SECRET,
+MAL_REDIRECT_URI (servers still need /manage_mal to be turned on).
+If the secret stops working (regenerated or revoked on MAL), syncing pauses everywhere and
+members who log anime are told an admin needs to run /manage_mal again.
 Linking works without a public website: after approving on MAL, the member copies the
 address their browser lands on and pastes it into the bot.
 """
@@ -49,6 +53,22 @@ CAP_MESSAGE = (
 )
 # Shown above each MAL log so the channel shows whose log it is (no ping).
 IMPORT_HEADER = "{user} logged on MyAnimeList"
+
+# Shown (only to them) when someone logs anime while their MAL sync can't work.
+EXPIRED_MEMBER_NOTICE = (
+    "⚠️ Your MyAnimeList link has expired, so this log wasn't added to your MAL list and new "
+    "episodes on MAL aren't being logged. Use `/mal link` to reconnect."
+)
+EXPIRED_SERVER_NOTICE = (
+    "⚠️ MyAnimeList syncing is paused in this server because its MAL connection has expired, "
+    "so this log wasn't added to your MAL list. An admin needs to run `/manage_mal` again."
+)
+SECRET_CHECK_HOURS = 6   # how often the stored app secret is re-checked with MAL
+
+# The bot's MyAnimeList app (registered at https://myanimelist.net/apiconfig). Only the
+# Client ID is here (it's in every login link anyway); the secret is set with /manage_mal.
+DEFAULT_CLIENT_ID = "c6bb34ef29405bb8a3bdb6258c5ac65a"
+DEFAULT_REDIRECT_URI = "http://localhost/"
 
 AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
 TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
@@ -108,20 +128,25 @@ class MalCog(commands.Cog):
         self.pending: Dict[str, Tuple[str, str, datetime]] = {}   # user_id -> (verifier, state, started)
         self.lock = asyncio.Lock()   # one MAL sync at a time, so pushes and imports never cross
         self.session: Optional[aiohttp.ClientSession] = None
+        self.stored_secret: str = ""          # set with /manage_mal (loaded in init_db)
+        self.app_broken = False               # MAL stopped accepting the secret
+        self.enabled_guilds: set = set()      # servers where an admin connected MAL
+        self.push_tasks: Dict[str, asyncio.Task] = {}   # user_id -> their latest Discord -> MAL push
+        self.last_secret_check: Optional[datetime] = None
 
     # ---------------- setup ----------------
 
     @property
     def client_id(self) -> str:
-        return os.getenv("MAL_CLIENT_ID", "").strip()
+        return os.getenv("MAL_CLIENT_ID", "").strip() or DEFAULT_CLIENT_ID
 
     @property
     def client_secret(self) -> str:
-        return os.getenv("MAL_CLIENT_SECRET", "").strip()
+        return os.getenv("MAL_CLIENT_SECRET", "").strip() or self.stored_secret
 
     @property
     def redirect_uri(self) -> str:
-        return os.getenv("MAL_REDIRECT_URI", "").strip()
+        return os.getenv("MAL_REDIRECT_URI", "").strip() or DEFAULT_REDIRECT_URI
 
     async def cog_load(self):
         await self.init_db()
@@ -157,8 +182,137 @@ class MalCog(commands.Cog):
                     mal_id INTEGER PRIMARY KEY,
                     anilist_id INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS mal_app (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE TABLE IF NOT EXISTS mal_guilds (
+                    guild_id TEXT PRIMARY KEY,
+                    enabled_by TEXT,
+                    enabled_at TEXT
+                );
             """)
             await db.commit()
+            async with db.execute("SELECT key, value FROM mal_app") as cur:
+                app = dict(await cur.fetchall())
+            async with db.execute("SELECT guild_id FROM mal_guilds") as cur:
+                self.enabled_guilds = {row[0] for row in await cur.fetchall()}
+        self.stored_secret = app.get("client_secret") or ""
+        self.app_broken = app.get("broken") == "1"
+
+    # ---------------- server connection (/manage_mal) ----------------
+
+    async def _set_app_value(self, key: str, value: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("INSERT OR REPLACE INTO mal_app (key, value) VALUES (?, ?)", (key, value))
+            await db.commit()
+
+    async def set_app_broken(self, broken: bool):
+        if self.app_broken != broken:
+            self.app_broken = broken
+            await self._set_app_value("broken", "1" if broken else "0")
+            if broken:
+                logger.error("[MAL] MyAnimeList no longer accepts the app secret; syncing paused until /manage_mal")
+
+    def guild_ready(self, guild_id) -> bool:
+        """MAL syncing works in this server: connected there, and the secret still works."""
+        return bool(self.client_id and self.client_secret and not self.app_broken
+                    and str(guild_id) in self.enabled_guilds)
+
+    async def check_secret(self, secret: str) -> Optional[bool]:
+        """Ask MAL whether this app secret is right, without any member's login: a refresh with
+        a fake token is refused as "invalid_client" only when the app itself is wrong.
+        Returns True / False, or None if MAL couldn't be asked."""
+        try:
+            status, body = await self._http("POST", TOKEN_URL, data={
+                "client_id": self.client_id, "client_secret": secret,
+                "grant_type": "refresh_token", "refresh_token": "connection-check",
+            })
+        except Exception as e:
+            logger.warning(f"[MAL] Couldn't reach MyAnimeList to check the secret: {e}")
+            return None
+        if body.get("error") == "invalid_client":
+            return False
+        if status >= 500 or not body.get("error"):
+            return None
+        return True
+
+    async def log_notice(self, guild, member) -> Optional[str]:
+        """After someone uses /log_anime: a notice for them if their MAL sync can't work
+        (their link expired, or the server's MAL connection expired). None otherwise."""
+        if guild is None or str(guild.id) not in self.enabled_guilds:
+            return None
+        user_id = str(member.id)
+        link = await self.get_link(user_id)
+        if not link:
+            return None
+        task = self.push_tasks.get(user_id)
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=15)   # let this log's MAL update finish first
+        if self.app_broken:
+            return EXPIRED_SERVER_NOTICE
+        link = await self.get_link(user_id)
+        if link and link["broken"]:
+            return EXPIRED_MEMBER_NOTICE
+        return None
+
+    @app_commands.command(name="manage_mal", description="[ADMIN] Connect this server to the bot's MyAnimeList app, or disconnect it")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(action="What to do", secret="The MAL app's Client Secret (only needed to connect)")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Connect", value="connect"),
+        app_commands.Choice(name="Disconnect", value="disconnect"),
+        app_commands.Choice(name="Show status", value="status"),
+    ])
+    async def manage_mal(self, interaction: discord.Interaction, action: app_commands.Choice[str], secret: Optional[str] = None):
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            await interaction.response.send_message("You need administrator permission for this.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)   # only the admin sees this, secret included
+        guild_id = str(interaction.guild_id)
+
+        if action.value == "connect":
+            if not secret or not secret.strip():
+                reply = "Add the MyAnimeList app's Client Secret in the `secret` option."
+            else:
+                ok = await self.check_secret(secret.strip())
+                if ok is None:
+                    reply = "Couldn't reach MyAnimeList to check the secret. Please try again in a minute."
+                elif not ok:
+                    reply = ("MyAnimeList rejected that secret. Copy the Client Secret from "
+                             "https://myanimelist.net/apiconfig and try again.")
+                else:
+                    self.stored_secret = secret.strip()
+                    await self._set_app_value("client_secret", self.stored_secret)
+                    await self.set_app_broken(False)
+                    self.last_secret_check = now_utc()
+                    async with aiosqlite.connect(self.db_path) as db:
+                        await db.execute("INSERT OR REPLACE INTO mal_guilds (guild_id, enabled_by, enabled_at) VALUES (?, ?, ?)",
+                                         (guild_id, str(interaction.user.id), now_utc().isoformat()))
+                        await db.commit()
+                    self.enabled_guilds.add(guild_id)
+                    reply = "✅ MyAnimeList is connected in this server. Members can now use `/mal link`."
+                    logger.info(f"[MAL] {interaction.user} connected MAL in guild {guild_id}")
+
+        elif action.value == "disconnect":
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("DELETE FROM mal_guilds WHERE guild_id = ?", (guild_id,))
+                await db.commit()
+            self.enabled_guilds.discard(guild_id)
+            reply = ("MyAnimeList is disconnected in this server: `/mal link` is off and nothing syncs here. "
+                     "Members' links are kept, so connecting again resumes syncing.")
+
+        else:
+            if guild_id not in self.enabled_guilds:
+                reply = "MyAnimeList isn't connected in this server. Use `/manage_mal action:Connect secret:<Client Secret>`."
+            elif self.app_broken or not self.client_secret:
+                reply = "⚠️ MyAnimeList's connection has expired (the secret no longer works). Run `/manage_mal action:Connect` with the current Client Secret."
+            else:
+                links = await self.all_links()
+                reply = f"MyAnimeList is connected in this server and working. {len(links)} members have a working link."
+        await interaction.followup.send(reply, ephemeral=True)
 
     async def cog_unload(self):
         self.poll.cancel()
@@ -233,18 +387,25 @@ class MalCog(commands.Cog):
                 body = None
             return resp.status, body if isinstance(body, dict) else {}
 
-    async def _token_request(self, fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    async def _token_request(self, fields: Dict[str, str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Returns (tokens, None) or (None, MAL's error code). "invalid_client" means MAL no
+        longer accepts the app's secret: the server's connection has expired."""
         data = dict(fields, client_id=self.client_id)
         if self.client_secret:
             data["client_secret"] = self.client_secret
         status, body = await self._http("POST", TOKEN_URL, data=data)
         if status != 200 or "access_token" not in body:
-            logger.warning(f"[MAL] Token request ({fields.get('grant_type')}) failed: {status} {body.get('error')}")
-            return None
-        return body
+            error = body.get("error") or f"http_{status}"
+            logger.warning(f"[MAL] Token request ({fields.get('grant_type')}) failed: {status} {error}")
+            if error == "invalid_client":
+                await self.set_app_broken(True)
+            return None, error
+        return body, None
 
     async def _refresh(self, link: Dict[str, Any]) -> Optional[str]:
-        tokens = await self._token_request({"grant_type": "refresh_token", "refresh_token": link.get("refresh_token") or ""})
+        tokens, error = await self._token_request({"grant_type": "refresh_token", "refresh_token": link.get("refresh_token") or ""})
+        if tokens is None and (error == "invalid_client" or error.startswith("http_5")):
+            return None   # the app's problem (or MAL being down), not this member's link
         if tokens is None:
             link["broken"] = 1
             async with aiosqlite.connect(self.db_path) as db:
@@ -320,9 +481,13 @@ class MalCog(commands.Cog):
 
     @mal.command(name="link", description="Link your MyAnimeList account to sync anime logs both ways")
     async def mal_link(self, interaction: discord.Interaction):
-        if not self.client_id:
+        guild_id = str(interaction.guild_id)
+        if guild_id in self.enabled_guilds and (self.app_broken or not self.client_secret):
+            await interaction.response.send_message(EXPIRED_SERVER_NOTICE.replace(", so this log wasn't added to your MAL list", ""), ephemeral=True)
+            return
+        if not self.guild_ready(guild_id):
             await interaction.response.send_message(
-                "MyAnimeList linking isn't set up yet. An admin needs to add MAL_CLIENT_ID to the bot's settings.",
+                "MyAnimeList linking isn't set up in this server. An admin can turn it on with `/manage_mal`.",
                 ephemeral=True,
             )
             return
@@ -372,7 +537,9 @@ class MalCog(commands.Cog):
         fields = {"grant_type": "authorization_code", "code": code, "code_verifier": verifier}
         if self.redirect_uri:
             fields["redirect_uri"] = self.redirect_uri
-        tokens = await self._token_request(fields)
+        tokens, error = await self._token_request(fields)
+        if tokens is None and error == "invalid_client":
+            return False, "MyAnimeList syncing is paused in this server: its MAL connection has expired. An admin needs to run `/manage_mal` again."
         if tokens is None:
             return False, "MyAnimeList didn't accept that. Please start again with `/mal link`."
         self.pending.pop(user_id, None)
@@ -440,6 +607,10 @@ class MalCog(commands.Cog):
         lines = [f"Linked to {link['mal_name']}."]
         if link["broken"]:
             lines.append("⚠️ The MyAnimeList login expired, so nothing syncs. Please `/mal link` again.")
+        if str(interaction.guild_id) in self.enabled_guilds and (self.app_broken or not self.client_secret):
+            lines.append("⚠️ MyAnimeList syncing is paused in this server: its MAL connection has expired. An admin needs to run `/manage_mal` again.")
+        elif not self.guild_ready(interaction.guild_id):
+            lines.append("MyAnimeList isn't connected in this server, so nothing syncs here.")
         lines.append(
             f"Logged from MyAnimeList today: {seconds / 3600:.1f}h of {DAILY_CAP_HOURS}h"
             + (" (cap reached; more MAL updates today are ignored)." if capped else ".")
@@ -451,7 +622,11 @@ class MalCog(commands.Cog):
     @commands.Cog.listener()
     async def on_anime_activity_logged(self, activity, source: str):
         """After /log_anime: add the episodes to the member's MAL list."""
-        if source != "command" or not self.client_id:
+        if source != "command":
+            return
+        # Remembered so /log_anime's expiry notice can wait for this update to finish
+        self.push_tasks[str(activity.user_id)] = asyncio.current_task()
+        if not self.guild_ready(getattr(activity, "guild_id", None)):
             return
         link = await self.get_link(str(activity.user_id))
         if not link or link["broken"]:
@@ -460,6 +635,11 @@ class MalCog(commands.Cog):
         episodes = int((activity.meta or {}).get("episodes") or 0)
         if not mal_id or episodes <= 0:
             return
+        await self.push_to_mal(link, int(mal_id), episodes)
+
+    async def push_to_mal(self, link: Dict[str, Any], mal_id: int, episodes: int):
+        """Add `episodes` to this anime on the member's MAL list (Watching, or Completed at the
+        last episode). Shows already Completed on MAL are left alone."""
         try:
             async with self.lock:
                 status, details = await self._api(link, "GET", f"/anime/{mal_id}", params={"fields": "num_episodes,my_list_status"})
@@ -490,12 +670,21 @@ class MalCog(commands.Cog):
 
     @tasks.loop(minutes=POLL_MINUTES)
     async def poll(self):
-        if not self.client_id:
+        if not self.client_secret:
             return
+        # Every few hours, check MAL still accepts the secret, so an expired connection is
+        # noticed (and members told) even before a login needs refreshing
+        if self.last_secret_check is None or now_utc() - self.last_secret_check > timedelta(hours=SECRET_CHECK_HOURS):
+            ok = await self.check_secret(self.client_secret)
+            if ok is not None:
+                self.last_secret_check = now_utc()
+                await self.set_app_broken(not ok)
         channel = self.bot.get_channel(MAL_LOG_CHANNEL_ID)
         if channel is None:
             logger.warning(f"[MAL] MAL log channel {MAL_LOG_CHANNEL_ID} not found; MAL -> Discord paused")
             return
+        if not self.guild_ready(channel.guild.id):
+            return   # MAL not connected (or expired) in the server that has the MAL log channel
         for link in await self.all_links():
             try:
                 await self.import_from_mal(link, channel)

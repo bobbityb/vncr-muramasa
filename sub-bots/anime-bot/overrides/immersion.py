@@ -150,6 +150,16 @@ class ImmersionCog(ParentImmersionCog):
         await ParentImmersionCog.log_anime.callback(
             self, interaction, name, episodes, episode_duration, date, comment
         )
+        # If their MyAnimeList sync can't work (their link, or the server's MAL connection,
+        # has expired), tell them right here, only visible to them
+        try:
+            mal = self.bot.get_cog("MalCog")
+            if mal is not None and hasattr(mal, "log_notice"):
+                notice = await mal.log_notice(interaction.guild, interaction.user)
+                if notice:
+                    await interaction.followup.send(notice, ephemeral=True)
+        except Exception as e:
+            logger.warning(f"MAL notice after /log_anime failed: {e}")
 
     @log_anime.autocomplete("name")
     async def log_anime_name_autocomplete(self, interaction: discord.Interaction, current: str):
