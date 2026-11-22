@@ -965,55 +965,6 @@ class ImmersionCog(ParentImmersionCog):
             logger.error(f"Error while running class_roles_sync: {exc}")
             await interaction.followup.send("An error occurred while syncing roles.", ephemeral=True)
 
-    @app_commands.command(
-        name="manage_class_announcements",
-        description="[ADMIN] Choose where anime class promotions are announced"
-    )
-    @app_commands.describe(channel="Channel for class announcements (leave blank to disable)")
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.guild_only()
-    async def set_class_announcements_channel(
-        self,
-        interaction: discord.Interaction,
-        channel: Optional[discord.TextChannel] = None,
-    ):
-        """Update the anime bot config so class promotions post in the selected channel."""
-        await interaction.response.defer(ephemeral=True)
-
-        guild = interaction.guild
-        if guild is None:
-            await interaction.followup.send("This command must be used inside the server you want to configure.", ephemeral=True)
-            return
-
-        if channel and channel.guild != guild:
-            await interaction.followup.send("Please pick a channel from this server.", ephemeral=True)
-            return
-
-        bot_config = getattr(self.bot, "config", {})
-        guilds_config = bot_config.setdefault("guilds", {})
-        guild_config = guilds_config.setdefault(str(guild.id), {})
-
-        if channel:
-            guild_config["class_announcements_channel"] = channel.id
-            response = f"Class announcements will now post in {channel.mention}."
-        else:
-            guild_config.pop("class_announcements_channel", None)
-            response = "Class announcements channel cleared. Falling back to the welcome channel."
-
-        save_config = getattr(self.bot, "save_config", None)
-        if callable(save_config):
-            try:
-                save_config()
-            except Exception as exc:
-                logger.error("Failed to persist class announcement channel update: %s", exc)
-                await interaction.followup.send(
-                    "Updated in memory, but failed to write config file. Check logs for details.",
-                    ephemeral=True,
-                )
-                return
-
-        await interaction.followup.send(response, ephemeral=True)
-
     @app_commands.command(name="log_server_leaderboard", description="View server rankings by total immersion time")
     @app_commands.describe(
         timeframe="Time period for the leaderboard",
