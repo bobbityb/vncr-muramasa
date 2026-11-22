@@ -20,6 +20,24 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 from cogs.immersion import ANIME_CLASS_ROLE_DEFINITIONS  # noqa: E402
 
+# Roles and channels shown in /help, read from the features themselves so they stay in step
+from .consequences import PENALTY_ROLE_ID, REWARD_ROLE_ID, TOP_ROLE_IDS, PENALTY_THRESHOLD_HOURS, REWARD_THRESHOLD_HOURS  # noqa: E402
+from .immersion import LOG_BAN_ROLE_ID  # noqa: E402
+from .mal import MAL_LOG_CHANNEL_ID, DAILY_CAP_HOURS  # noqa: E402
+
+
+def _field_chunks(lines, limit=1024):
+    """Split lines into embed-field-sized chunks."""
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 1 > limit:
+            yield chunk
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        yield chunk
+
+
 class CommandsCog(commands.Cog):
     """LJTA Commands - General bot commands with anime branding"""
     
@@ -268,14 +286,18 @@ class CommandsCog(commands.Cog):
     @app_commands.choices(category=[
         app_commands.Choice(name="logging", value="logging"),
         app_commands.Choice(name="utility", value="utility"),
-        app_commands.Choice(name="fun", value="fun")
+        app_commands.Choice(name="fun", value="fun"),
+        app_commands.Choice(name="admin", value="admin"),
     ])
     async def help_command(self, interaction: discord.Interaction,
                            category: app_commands.Choice[str] = None):
         """LJTA help command with anime branding"""
+        if category and category.value == "admin":
+            await self._admin_help(interaction)
+            return
         try:
             await interaction.response.defer()
-            
+
             if category:
                 # Category-specific help
                 embed = discord.Embed(
@@ -288,13 +310,24 @@ class CommandsCog(commands.Cog):
                     embed.add_field(
                         name="📝 Core Logging",
                         value=(
+                            "• `/log_anime`: Log anime watching with episode count\n"
                             "• `/log_manual`: Manual activity logging with full customization\n"
                             "• `/log_video`: Log video watching with automatic duration detection\n"
                             "• `/log_vn`: Log visual novel reading with optional character counts\n"
                             "• `/log_manga`: Log manga reading with optional page counts\n"
                             "• `/log_book`: Log book reading with optional page counts\n"
-                            "• `/log_anime`: Log anime watching with episode count\n"
                             "• `/log_game`: Log game playing time"
+                        ),
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="🔗 MyAnimeList",
+                        value=(
+                            "• `/mal link`: Link your MyAnimeList account\n"
+                            "• `/mal status`: See your link and today's MAL time\n"
+                            "• `/mal unlink`: Stop syncing with MyAnimeList\n"
+                            "Once linked, `/log_anime` also updates your MAL list, and episodes you mark as "
+                            f"watched on MAL are logged in <#{MAL_LOG_CHANNEL_ID}> (up to {DAILY_CAP_HOURS}h a day)."
                         ),
                         inline=False
                     )
@@ -315,10 +348,7 @@ class CommandsCog(commands.Cog):
                     )
                     embed.add_field(
                         name="💾 Data Management",
-                        value=(
-                            "• `/log_export`: Export activities to compressed JSONL file\n"
-                            "• `/log_import`: Import activities or manage import history"
-                        ),
+                        value="• `/log_export`: Export activities to compressed JSONL file",
                         inline=False
                     )
                     embed.add_field(
@@ -332,13 +362,17 @@ class CommandsCog(commands.Cog):
                     embed.add_field(
                         name="🔧 Utilities",
                         value=(
-                            "• `/log_undo`: Undo the last activity or specific activity by ID"
+                            "• `/log_undo`: Undo your last activity or a specific one by ID "
+                            "(or press Undo Log on the log)"
                         ),
                         inline=False
                     )
                     embed.add_field(
                         name="💡 Tips",
-                        value="Times like '30m', '1h30m', or just '90' (minutes). Use `/help` for more info.",
+                        value=(
+                            "Times like '30m', '1h30m', or just '90' (minutes). Use `/help` for more info.\n"
+                            "Admins: `/help category:admin` lists the admin commands."
+                        ),
                         inline=False
                     )
 
@@ -401,6 +435,11 @@ class CommandsCog(commands.Cog):
                     inline=False
                 )
                 embed.add_field(
+                    name="Admin",
+                    value="Admin commands and the reward/penalty roles: `/help category:admin` (admins only)",
+                    inline=False
+                )
+                embed.add_field(
                     name="📋 Quick Start",
                     value=(
                         "• Log anime: `/log_anime name:\"Death Note\" episodes:1`\n"
@@ -417,6 +456,65 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error in help command: {e}")
             await interaction.followup.send("An error occurred while generating help. Please try again.", ephemeral=True)
+
+    async def _admin_help(self, interaction: discord.Interaction):
+        """Admin section of /help: only admins can open it, and only they see it."""
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            await interaction.response.send_message("This section is for admins.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="📖 Help: Admin", color=discord.Color.dark_red())
+
+        # Every admin-only command the bot has (read from the bot, so the list is always current)
+        admin_lines = []
+        for command in sorted(self.bot.tree.get_commands(), key=lambda c: c.name):
+            perms_needed = getattr(command, "default_permissions", None)
+            if perms_needed is None or not perms_needed.value:
+                continue
+            description = (command.description or "").replace("[ADMIN]", "").strip()
+            admin_lines.append(f"• `/{command.name}`: {description}")
+        for number, chunk in enumerate(_field_chunks(admin_lines or ["None found"])):
+            embed.add_field(name="🛡️ Admin Commands" if number == 0 else "🛡️ Admin Commands (cont.)", value=chunk, inline=False)
+
+        embed.add_field(
+            name="🧹 Admin Options on Member Commands",
+            value=(
+                "• `/log_undo user:<member>`: undo that member's latest log\n"
+                "• `/log_undo activity_id:<id>`: undo anyone's log by ID\n"
+                "• Undo Log button: works on anyone's log for admins"
+            ),
+            inline=False,
+        )
+
+        guild = interaction.guild
+
+        def role_text(role_id: int) -> str:
+            role = guild.get_role(role_id) if guild else None
+            return role.mention if role else f"not found (ID {role_id})"
+
+        medals = ["🥇", "🥈", "🥉"]
+        top_lines = " ".join(f"{medals[i]} {role_text(role_id)}" for i, role_id in enumerate(TOP_ROLE_IDS[:3]))
+        system = self.bot.get_cog("ConsequencesCog")
+        status = ""
+        if system is not None and guild is not None:
+            try:
+                status = "\nMonthly penalty/reward system: " + ("On" if system.guild_state(guild)["enabled"] else "Off")
+            except Exception:
+                status = ""
+        embed.add_field(
+            name="🏅 Roles Currently Set",
+            value=(
+                f"• Monthly leaderboard (top 3 anime time): {top_lines}\n"
+                f"• {REWARD_THRESHOLD_HOURS}h+ logged in a month (reward): {role_text(REWARD_ROLE_ID)}\n"
+                f"• Under {PENALTY_THRESHOLD_HOURS}h logged in a month (punishment): {role_text(PENALTY_ROLE_ID)}\n"
+                f"• Logging ban (can't use /log_anime, MAL updates not counted): {role_text(LOG_BAN_ROLE_ID)}"
+                f"{status}"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="LJTA • Admin Help (only you can see this)")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(CommandsCog(bot))
