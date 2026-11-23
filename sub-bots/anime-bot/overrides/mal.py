@@ -7,6 +7,12 @@ Members link their MyAnimeList account with /mal link. Then, in both directions:
   as normal anime logs and posted in the MAL log channel, looking the same as /log_anime.
   At most 5 hours a day come in this way. When a member reaches the cap they're pinged
   once, and further MAL updates that day are dropped (not logged or posted, ever).
+- Undo works both ways, only for logs synced while linked: undoing such a log in Discord
+  takes its episodes back off MAL, and removing episodes on MAL undoes (or shortens) the
+  synced logs from the last MAL_UNDO_DAYS days. Logs from before linking never affect the
+  other side.
+- /log_anime can't log more episodes than MAL says the anime has (the anime ImmersionCog's
+  _anime_total_episodes uses anime_info here).
 
 Setup: the MAL app's Client ID is built in (DEFAULT_CLIENT_ID below; it's public anyway).
 Its Client Secret is NOT in the code: an admin enters it once per server with
@@ -45,6 +51,7 @@ MAL_LOG_CHANNEL_ID = 1415741464545329272   # MAL -> Discord logs and cap notices
 DAILY_CAP_HOURS = 5                       # max anime time per member per day (UTC) from MAL
 POLL_MINUTES = 10                         # how often linked lists are checked
 FALLBACK_EPISODE_MINUTES = 24             # when MAL doesn't know an episode's length
+MAL_UNDO_DAYS = 7                         # removing episodes on MAL undoes synced logs this recent
 
 # Posted once when a member reaches the cap. {user} pings them; {hours} is the cap.
 CAP_MESSAGE = (
@@ -53,6 +60,8 @@ CAP_MESSAGE = (
 )
 # Shown above each MAL log so the channel shows whose log it is (no ping).
 IMPORT_HEADER = "{user} logged on MyAnimeList"
+# Posted (no ping) when episodes removed on MAL undo or shorten synced logs; {changes} is one line per log.
+REMOVAL_MESSAGE = "{user} removed episodes on MyAnimeList, so these logs changed:\n{changes}"
 
 # Shown (only to them) when someone logs anime while their MAL sync can't work.
 EXPIRED_MEMBER_NOTICE = (
@@ -133,6 +142,7 @@ class MalCog(commands.Cog):
         self.enabled_guilds: set = set()      # servers where an admin connected MAL
         self.push_tasks: Dict[str, asyncio.Task] = {}   # user_id -> their latest Discord -> MAL push
         self.last_secret_check: Optional[datetime] = None
+        self.anime_cache: Dict[int, Tuple[datetime, Tuple[int, bool]]] = {}   # mal_id -> (fetched, info)
 
     # ---------------- setup ----------------
 
@@ -190,6 +200,19 @@ class MalCog(commands.Cog):
                     guild_id TEXT PRIMARY KEY,
                     enabled_by TEXT,
                     enabled_at TEXT
+                );
+                -- Discord logs synced with MAL while linked, so an undo on one side can be
+                -- mirrored on the other. The log's episodes on MAL are start_ep+1 .. end_ep.
+                CREATE TABLE IF NOT EXISTS mal_sync (
+                    activity_id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    anime_id INTEGER NOT NULL,
+                    start_ep INTEGER NOT NULL,
+                    end_ep INTEGER NOT NULL,
+                    direction TEXT NOT NULL,      -- 'to_mal' (logged in Discord) or 'from_mal'
+                    prev_status TEXT,             -- to_mal: MAL status before (NULL = not on the list)
+                    created_at TEXT NOT NULL,
+                    undone INTEGER NOT NULL DEFAULT 0
                 );
             """)
             await db.commit()
@@ -375,12 +398,49 @@ class MalCog(commands.Cog):
             )
             await db.commit()
 
+    async def add_sync(self, activity_id: int, user_id: str, anime_id: int, start: int, end: int,
+                       direction: str, prev_status: Optional[str] = None):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO mal_sync (activity_id, user_id, anime_id, start_ep, end_ep, direction, "
+                "prev_status, created_at, undone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (int(activity_id), user_id, int(anime_id), start, end, direction, prev_status, now_utc().isoformat()),
+            )
+            await db.commit()
+
+    async def get_sync(self, activity_id: int) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM mal_sync WHERE activity_id = ? AND undone = 0", (int(activity_id),)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def recent_syncs(self, user_id: str, anime_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Synced logs from the last MAL_UNDO_DAYS days that aren't undone, top episodes first."""
+        cutoff = (now_utc() - timedelta(days=MAL_UNDO_DAYS)).isoformat()
+        query = "SELECT * FROM mal_sync WHERE user_id = ? AND undone = 0 AND created_at >= ?"
+        args: list = [user_id, cutoff]
+        if anime_id is not None:
+            query += " AND anime_id = ?"
+            args.append(int(anime_id))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query + " ORDER BY end_ep DESC, activity_id DESC", args) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def _sync_db(self, sql: str, args: tuple):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, args)
+            await db.commit()
+
     # ---------------- HTTP ----------------
 
-    async def _http(self, method: str, url: str, *, headers=None, params=None, data=None) -> Tuple[int, Dict[str, Any]]:
+    async def _http(self, method: str, url: str, *, headers=None, params=None, data=None,
+                    timeout: Optional[float] = None) -> Tuple[int, Dict[str, Any]]:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        async with self.session.request(method, url, headers=headers, params=params, data=data) as resp:
+        extra = {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout else {}
+        async with self.session.request(method, url, headers=headers, params=params, data=data, **extra) as resp:
             try:
                 body = await resp.json(content_type=None)
             except Exception:
@@ -447,6 +507,28 @@ class MalCog(commands.Cog):
             path = (body.get("paging") or {}).get("next") if all_pages else None
             params = None   # the "next" link already carries them
         return entries
+
+    async def anime_info(self, mal_id: int) -> Optional[Tuple[int, bool]]:
+        """(number of episodes, still airing) from MyAnimeList's public data; needs only the
+        Client ID, no member login. 0 episodes = MAL doesn't know yet. None if MAL can't be
+        reached (then MAL doesn't cap the log). Cached for 12 hours."""
+        cached = self.anime_cache.get(int(mal_id))
+        if cached and now_utc() - cached[0] < timedelta(hours=12):
+            return cached[1]
+        try:
+            status, body = await self._http(
+                "GET", f"{API_URL}/anime/{int(mal_id)}", headers={"X-MAL-CLIENT-ID": self.client_id},
+                params={"fields": "num_episodes,status"}, timeout=6,
+            )
+        except Exception as e:
+            logger.warning(f"[MAL] Couldn't read the episode count of MAL anime {mal_id}: {e!r}")
+            return None
+        if status != 200:
+            logger.warning(f"[MAL] Couldn't read the episode count of MAL anime {mal_id}: {status}")
+            return None
+        info = (int(body.get("num_episodes") or 0), body.get("status") in ("currently_airing", "not_yet_aired"))
+        self.anime_cache[int(mal_id)] = (now_utc(), info)
+        return info
 
     async def anilist_name(self, mal_id: int, title: str) -> str:
         """What to give the anime log builder: the AniList page for this MAL anime (so the log
@@ -557,6 +639,7 @@ class MalCog(commands.Cog):
                 if row and row[0] != user_id:
                     return False, "That MyAnimeList account is already linked to another Discord account."
                 await db.execute("DELETE FROM mal_snapshot WHERE user_id = ?", (user_id,))
+                await db.execute("DELETE FROM mal_sync WHERE user_id = ?", (user_id,))   # a new link starts fresh
                 await db.execute(
                     "INSERT OR REPLACE INTO mal_links (user_id, mal_user_id, mal_name, access_token, refresh_token, "
                     "expires_at, linked_at, broken) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
@@ -589,6 +672,7 @@ class MalCog(commands.Cog):
             async with aiosqlite.connect(self.db_path) as db:
                 cur = await db.execute("DELETE FROM mal_links WHERE user_id = ?", (user_id,))
                 await db.execute("DELETE FROM mal_snapshot WHERE user_id = ?", (user_id,))
+                await db.execute("DELETE FROM mal_sync WHERE user_id = ?", (user_id,))
                 await db.commit()
                 removed = cur.rowcount
         self.pending.pop(user_id, None)
@@ -631,15 +715,20 @@ class MalCog(commands.Cog):
         link = await self.get_link(str(activity.user_id))
         if not link or link["broken"]:
             return
-        mal_id = ((activity.meta or {}).get("anilist") or {}).get("mal_id")
-        episodes = int((activity.meta or {}).get("episodes") or 0)
+        meta = activity.meta or {}
+        mal_id = (meta.get("anilist") or {}).get("mal_id")
+        episodes = int(meta.get("episodes") or 0)
         if not mal_id or episodes <= 0:
             return
-        await self.push_to_mal(link, int(mal_id), episodes)
+        await self.push_to_mal(link, int(mal_id), episodes, getattr(activity, "id", None),
+                               complete=bool(meta.get("logged_as_complete")))
 
-    async def push_to_mal(self, link: Dict[str, Any], mal_id: int, episodes: int):
+    async def push_to_mal(self, link: Dict[str, Any], mal_id: int, episodes: int,
+                          activity_id: Optional[int] = None, *, complete: bool = False):
         """Add `episodes` to this anime on the member's MAL list (Watching, or Completed at the
-        last episode). Shows already Completed on MAL are left alone."""
+        last episode; `complete` = logged with "complete", so straight to Completed). Shows
+        already Completed on MAL are left alone. Remembers which MAL episodes the log added,
+        so undoing it on either side can be mirrored."""
         try:
             async with self.lock:
                 status, details = await self._api(link, "GET", f"/anime/{mal_id}", params={"fields": "num_episodes,my_list_status"})
@@ -650,9 +739,10 @@ class MalCog(commands.Cog):
                 if current.get("status") == "completed":
                     return   # already finished on MAL: leave rewatches to the member
                 total = int(details.get("num_episodes") or 0)   # 0 = unknown (still airing)
-                watched = int(current.get("num_episodes_watched") or 0) + episodes
+                before = int(current.get("num_episodes_watched") or 0)
+                watched = before + episodes
                 new_status = "watching"
-                if total and watched >= total:
+                if total and (complete or watched >= total):
                     watched, new_status = total, "completed"
                 status, _ = await self._api(
                     link, "PATCH", f"/anime/{mal_id}/my_list_status",
@@ -661,10 +751,113 @@ class MalCog(commands.Cog):
                 if status != 200:
                     logger.warning(f"[MAL] Couldn't update MAL anime {mal_id} for {link['user_id']}: {status}")
                     return
-                # So the MAL -> Discord check doesn't log these episodes a second time
-                await self.set_snapshot(link["user_id"], int(mal_id), watched)
+                # So the MAL -> Discord check doesn't log these episodes a second time. Only this
+                # change is counted, so episodes marked on MAL since the last check still get logged.
+                snapshot = (await self.get_snapshot(link["user_id"])).get(int(mal_id), 0)
+                await self.set_snapshot(link["user_id"], int(mal_id), snapshot + watched - before)
+                if activity_id and watched > before:
+                    await self.add_sync(activity_id, link["user_id"], int(mal_id), before, watched,
+                                        "to_mal", current.get("status"))
         except Exception as e:
             logger.exception(f"[MAL] Sync to MAL failed for {link['user_id']}: {e}")
+
+    # ---------------- undo, both ways ----------------
+
+    @commands.Cog.listener()
+    async def on_activity_undone(self, activity_id: int, user_id: str):
+        """A log was undone in Discord (Undo button or /log_undo). If it was synced with MAL
+        while linked, take its episodes back off the member's MAL list too. Logs that were
+        never synced (e.g. from before linking) leave MAL alone."""
+        try:
+            async with self.lock:
+                row = await self.get_sync(activity_id)
+                if row is None:
+                    return
+                await self._sync_db("UPDATE mal_sync SET undone = 1 WHERE activity_id = ?", (int(activity_id),))
+                link = await self.get_link(row["user_id"])
+                if not link or link["broken"] or not self.client_secret or self.app_broken:
+                    return
+                await self.remove_from_mal(link, row)
+        except Exception as e:
+            logger.exception(f"[MAL] Undo on MAL failed for log {activity_id}: {e}")
+
+    async def remove_from_mal(self, link: Dict[str, Any], row: Dict[str, Any]):
+        """Take one synced log's episodes back off the member's MAL list (call inside the lock)."""
+        user_id, anime_id = link["user_id"], int(row["anime_id"])
+        count = int(row["end_ep"]) - int(row["start_ep"])
+        if count <= 0:
+            return
+        status, details = await self._api(link, "GET", f"/anime/{anime_id}", params={"fields": "num_episodes,my_list_status"})
+        if status != 200:
+            logger.warning(f"[MAL] Couldn't read MAL anime {anime_id} for {user_id} to undo: {status}")
+            return
+        current = details.get("my_list_status")
+        if current:   # (if it's no longer on their list, there's nothing to take off)
+            watched = int(current.get("num_episodes_watched") or 0)
+            new_watched = max(0, watched - count)
+            if row["direction"] == "to_mal" and row["prev_status"] is None and new_watched == 0 \
+                    and not current.get("score"):
+                # The log had added the anime to their list: take it off again
+                status, _ = await self._api(link, "DELETE", f"/anime/{anime_id}/my_list_status")
+                ok = status in (200, 404)
+            else:
+                data = {"num_watched_episodes": str(new_watched)}
+                if row["direction"] == "to_mal" and row["prev_status"] and new_watched == int(row["start_ep"]):
+                    data["status"] = row["prev_status"]   # back to how it was before the log
+                elif current.get("status") == "completed" and new_watched < watched:
+                    data["status"] = "watching"
+                status, _ = await self._api(link, "PATCH", f"/anime/{anime_id}/my_list_status", data=data)
+                ok = status == 200
+            if not ok:
+                logger.warning(f"[MAL] Couldn't undo on MAL anime {anime_id} for {user_id}: {status}")
+                return
+            # Only our change, so the MAL -> Discord check doesn't see it as a removal on MAL
+            snapshot = (await self.get_snapshot(user_id)).get(anime_id, 0)
+            await self.set_snapshot(user_id, anime_id, max(0, snapshot - (watched - new_watched)))
+        # Synced logs above this one move down on the MAL list
+        await self._sync_db(
+            "UPDATE mal_sync SET start_ep = MAX(start_ep - ?, 0), end_ep = MAX(end_ep - ?, 0) "
+            "WHERE user_id = ? AND anime_id = ? AND undone = 0 AND start_ep >= ?",
+            (count, count, user_id, anime_id, int(row["end_ep"])),
+        )
+
+    async def undo_removed(self, link: Dict[str, Any], immersion, anime_id: int, watched: int) -> List[str]:
+        """Episodes above `watched` were removed on MAL: undo the synced logs they belonged to,
+        or shorten a log that lost only some (call inside the lock). Logs from before linking,
+        or synced more than MAL_UNDO_DAYS days ago, are left alone. Returns a line per log."""
+        user_id, changes = link["user_id"], []
+        for row in await self.recent_syncs(user_id, anime_id):
+            if int(row["end_ep"]) <= watched:
+                break   # top episodes first, so the rest are all still on MAL
+            activity = await immersion.activity_repo.get_activity_by_id(row["activity_id"])
+            if activity is None or str(activity.user_id) != user_id:
+                await self._sync_db("UPDATE mal_sync SET undone = 1 WHERE activity_id = ?", (row["activity_id"],))
+                continue   # already gone from Discord
+            episodes = int((activity.meta or {}).get("episodes") or 0)
+            keep = 0 if watched <= int(row["start_ep"]) else episodes - (int(row["end_ep"]) - watched)
+            if keep <= 0:
+                # A plain delete, not _undo_activity: that would take the episodes off MAL again
+                await immersion.activity_repo.delete_activity(activity.id, user_id)
+                await self._sync_db("UPDATE mal_sync SET undone = 1 WHERE activity_id = ?", (activity.id,))
+                changes.append(f"Undid log `{activity.id}`: {activity.name} ({episodes} episodes)")
+            else:
+                duration = round((activity.duration or 0) * keep / episodes)
+                async with aiosqlite.connect(immersion.db.db_path) as db:
+                    await db.execute(
+                        "UPDATE immersion_activities SET duration = ?, "
+                        "meta = json_set(COALESCE(meta, '{}'), '$.episodes', ?) WHERE id = ? AND deleted_at IS NULL",
+                        (duration, keep, activity.id),
+                    )
+                    await db.commit()
+                immersion.activity_repo.invalidate_user_cache(activity.user_id, activity.guild_id)
+                await self._sync_db("UPDATE mal_sync SET end_ep = ? WHERE activity_id = ?", (watched, activity.id))
+                changes.append(f"Shortened log `{activity.id}`: {activity.name} ({episodes} → {keep} episodes)")
+        if changes:
+            try:
+                await immersion.goal_service.refresh_user_goals(user_id)
+            except Exception as e:
+                logger.warning(f"[MAL] Goal refresh after MAL removal failed for {user_id}: {e}")
+        return changes
 
     # ---------------- MAL -> Discord ----------------
 
@@ -702,7 +895,7 @@ class MalCog(commands.Cog):
         immersion = self.bot.get_cog("ImmersionCog")
         if immersion is None:
             return
-        imported = False
+        imported, changes = False, []
         async with self.lock:
             entries = await self.fetch_list(link, all_pages=False)
             if entries is None:
@@ -722,8 +915,14 @@ class MalCog(commands.Cog):
                     continue
                 # Recorded first: whatever happens next, these episodes are never logged twice
                 await self.set_snapshot(link["user_id"], anime_id, watched)
+                if watched < before:
+                    # Episodes removed on MAL: undo the synced logs they came from (not while
+                    # rewatching, when MAL's count starts over)
+                    if not list_status.get("is_rewatching"):
+                        changes += await self.undo_removed(link, immersion, anime_id, watched)
+                    continue
                 new_episodes = watched - before
-                if new_episodes <= 0 or member is None or member.bot or banned or capped:
+                if member is None or member.bot or banned or capped:
                     continue
 
                 seconds_each = int(node.get("average_episode_duration") or 0) or FALLBACK_EPISODE_MINUTES * 60
@@ -741,6 +940,7 @@ class MalCog(commands.Cog):
                     if error:
                         logger.info(f"[MAL] Skipped {anime_id} for {link['user_id']}: {error}")
                         continue
+                    await self.add_sync(activity_id, link["user_id"], anime_id, before, before + fits, "from_mal")
                     used += fits * minutes_each * 60
                     imported = True
                     await self.set_daily(link["user_id"], day, used, False)
@@ -760,7 +960,20 @@ class MalCog(commands.Cog):
                         allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[member]),
                     )
 
-        if imported and member is not None:
+            # Anime taken off the MAL list don't show up in it at all: check recently synced ones
+            seen = {int(entry["node"]["id"]) for entry in entries}
+            for anime_id in sorted({int(r["anime_id"]) for r in await self.recent_syncs(link["user_id"])} - seen):
+                status, details = await self._api(link, "GET", f"/anime/{anime_id}", params={"fields": "my_list_status"})
+                if status == 200 and not details.get("my_list_status"):
+                    await self.set_snapshot(link["user_id"], anime_id, 0)
+                    changes += await self.undo_removed(link, immersion, anime_id, 0)
+
+        if changes:
+            mention = member.mention if member is not None else f"<@{link['user_id']}>"
+            await channel.send(REMOVAL_MESSAGE.format(user=mention, changes="\n".join(changes))[:2000],
+                               allowed_mentions=discord.AllowedMentions.none())
+
+        if (imported or changes) and member is not None:
             # Class roles, and the penalty/reward checks, follow the new total
             try:
                 self.bot.dispatch("anime_log_changed", guild, member)

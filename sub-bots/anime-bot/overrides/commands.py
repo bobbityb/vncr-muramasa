@@ -310,7 +310,7 @@ class CommandsCog(commands.Cog):
                     embed.add_field(
                         name="📝 Core Logging",
                         value=(
-                            "• `/log_anime`: Log anime watching with episode count\n"
+                            "• `/log_anime`: Log anime watching with episode count (or `complete` for the episodes you haven't logged yet)\n"
                             "• `/log_manual`: Manual activity logging with full customization\n"
                             "• `/log_video`: Log video watching with automatic duration detection\n"
                             "• `/log_vn`: Log visual novel reading with optional character counts\n"
@@ -327,7 +327,9 @@ class CommandsCog(commands.Cog):
                             "• `/mal status`: See your link and today's MAL time\n"
                             "• `/mal unlink`: Stop syncing with MyAnimeList\n"
                             "Once linked, `/log_anime` also updates your MAL list, and episodes you mark as "
-                            f"watched on MAL are logged in <#{MAL_LOG_CHANNEL_ID}> (up to {DAILY_CAP_HOURS}h a day)."
+                            f"watched on MAL are logged in <#{MAL_LOG_CHANNEL_ID}> (up to {DAILY_CAP_HOURS}h a day). "
+                            "Undoing a synced log removes its episodes on MAL, and removing episodes on MAL "
+                            "undoes the synced log."
                         ),
                         inline=False
                     )
