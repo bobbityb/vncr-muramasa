@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # SETTINGS - edit here. (The log channel, daily cap and log/cap/removal messages are
 # shared with MyAnimeList: see list_sync.py.)
 # ---------------------------------------------------------------------------
-DEFAULT_CLIENT_ID = ""   # the bot's AniList API client ID
+DEFAULT_CLIENT_ID = "57862"   # the bot's AniList API client ID (public: it's in every login link)
 
 # Shown (only to them) when someone logs anime while their AniList link has expired.
 EXPIRED_MEMBER_NOTICE = (
