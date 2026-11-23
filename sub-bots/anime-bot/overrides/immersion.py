@@ -163,16 +163,17 @@ class ImmersionCog(ParentImmersionCog):
         await ParentImmersionCog.log_anime.callback(
             self, interaction, name, episode_value, episode_duration, date, comment
         )
-        # If their MyAnimeList sync can't work (their link, or the server's MAL connection,
-        # has expired), tell them right here, only visible to them
-        try:
-            mal = self.bot.get_cog("MalCog")
-            if mal is not None and hasattr(mal, "log_notice"):
-                notice = await mal.log_notice(interaction.guild, interaction.user)
-                if notice:
-                    await interaction.followup.send(notice, ephemeral=True)
-        except Exception as e:
-            logger.warning(f"MAL notice after /log_anime failed: {e}")
+        # If their MyAnimeList/AniList sync can't work (their link, or the server's MAL
+        # connection, has expired), tell them right here, only visible to them
+        for cog_name in ("MalCog", "AniListCog"):
+            try:
+                site = self.bot.get_cog(cog_name)
+                if site is not None and hasattr(site, "log_notice"):
+                    notice = await site.log_notice(interaction.guild, interaction.user)
+                    if notice:
+                        await interaction.followup.send(notice, ephemeral=True)
+            except Exception as e:
+                logger.warning(f"{cog_name} notice after /log_anime failed: {e}")
 
     @log_anime.autocomplete("name")
     async def log_anime_name_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -909,6 +910,7 @@ class ImmersionCog(ParentImmersionCog):
             "manual": "after a manual sync.",
             "admin_time": "after an admin changed your anime watch time.",
             "mal_import": "after your MyAnimeList update.",
+            "anilist_import": "after your AniList update.",
         }
         trigger_phrase = trigger_map.get(source, "after your recent activity.")
 
