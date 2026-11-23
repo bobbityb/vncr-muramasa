@@ -11,7 +11,7 @@ OVERRIDES PROVIDED:
 ✅ log_undo + Undo Log button - Admins can undo other members' logs
 ✅ log_anime - Blocked for members with the logging-ban role (LOG_BAN_ROLE_ID);
    episodes also takes "complete"
-✅ _anime_total_episodes() - Caps anime logs at MyAnimeList's episode count (AniList fallback)
+✅ _anime_total_episodes() - Caps each member's logs of an anime at MyAnimeList's episode count (AniList fallback)
 ✅ manage_anime_time - Admins give or remove a member's anime watch time
 ✅ profile - Shows anime-focused immersion profile
 ✅ Helper methods for anime class progress display

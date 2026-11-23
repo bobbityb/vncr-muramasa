@@ -11,8 +11,8 @@ Members link their MyAnimeList account with /mal link. Then, in both directions:
   takes its episodes back off MAL, and removing episodes on MAL undoes (or shortens) the
   synced logs from the last MAL_UNDO_DAYS days. Logs from before linking never affect the
   other side.
-- /log_anime can't log more episodes than MAL says the anime has (the anime ImmersionCog's
-  _anime_total_episodes uses anime_info here).
+- A member can't log more episodes of an anime (all their logs together) than MAL says it has
+  (the anime ImmersionCog's _anime_total_episodes uses anime_info here).
 
 Setup: the MAL app's Client ID is built in (DEFAULT_CLIENT_ID below; it's public anyway).
 Its Client Secret is NOT in the code: an admin enters it once per server with
@@ -941,7 +941,9 @@ class MalCog(commands.Cog):
                         logger.info(f"[MAL] Skipped {anime_id} for {link['user_id']}: {error}")
                         continue
                     await self.add_sync(activity_id, link["user_id"], anime_id, before, before + fits, "from_mal")
-                    used += fits * minutes_each * 60
+                    # What was actually logged (fewer episodes if it hit the anime's episode count)
+                    logged = await immersion.activity_repo.get_activity_by_id(activity_id)
+                    used += logged.duration if logged is not None else fits * minutes_each * 60
                     imported = True
                     await self.set_daily(link["user_id"], day, used, False)
                     kwargs = {"embed": embed, "view": view}

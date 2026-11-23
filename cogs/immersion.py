@@ -2216,10 +2216,15 @@ class ImmersionCog(commands.Cog):
         if fallback_name and anime_context.get("anilist_id") is None:
             display_name = fallback_name
 
-        # Episode cap and "complete": only when the anime's episode count can be checked
+        # Episode cap and "complete": only when the anime's episode count can be checked.
+        # The cap is for all of the member's logs of this anime together, not per log.
         total_episodes, total_source, still_airing = await self._anime_total_episodes(anime_context)
         episode_note: Optional[Tuple[str, str]] = None
         logged_as_complete = isinstance(episodes, str)
+        already = 0
+        if total_episodes:
+            already = await self._anime_episodes_logged(user_id, display_name, anime_context.get("anilist_id"))
+        all_logged_error = f"❌ You've already logged all {total_episodes} episodes of {display_name}."
         if logged_as_complete:   # "complete": log the episodes not logged yet
             if still_airing:
                 return None, None, None, [], None, (
@@ -2231,18 +2236,22 @@ class ImmersionCog(commands.Cog):
                     f"❌ The number of episodes of {display_name} couldn't be checked, so `complete` can't be used. "
                     "Pick the anime from the suggestions, or enter the number of episodes instead."
                 )
-            already = await self._anime_episodes_logged(user_id, display_name, anime_context.get("anilist_id"))
             if already >= total_episodes:
-                return None, None, None, [], None, (
-                    f"❌ You've already logged all {total_episodes} episodes of {display_name}."
-                )
+                return None, None, None, [], None, all_logged_error
             episodes = total_episodes - already
             episode_note = ("✅ Completed", f"Logged the {episodes} episodes you hadn't logged yet "
                                             f"({already} of {total_episodes} before).")
-        elif total_episodes and episodes > total_episodes:
-            episode_note = ("⚠️ Episodes capped", f"{display_name} only has {total_episodes} episodes on "
-                                                  f"{total_source}, so this log was reduced from {episodes} to {total_episodes}.")
-            episodes = total_episodes
+        elif total_episodes and already + episodes > total_episodes:
+            remaining = total_episodes - already
+            if remaining <= 0:
+                return None, None, None, [], None, all_logged_error
+            if already:
+                reason = (f"{display_name} has {total_episodes} episodes on {total_source} and you had "
+                          f"already logged {already}")
+            else:
+                reason = f"{display_name} only has {total_episodes} episodes on {total_source}"
+            episode_note = ("⚠️ Episodes capped", f"{reason}, so this log was reduced from {episodes} to {remaining}.")
+            episodes = remaining
 
         # Determine per-episode duration using AniList data when available
         official_duration = anime_context.get("episode_duration")
